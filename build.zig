@@ -49,7 +49,6 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 }
 
-
 /// Helper function to parse pkg-config include directories and register them
 fn addPkgConfigIncludes(b: *std.Build, translate_c: *std.Build.Step.TranslateC, lib_name: []const u8) void {
     // Run pkg-config to extract compilation flags for the given package
