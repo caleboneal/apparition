@@ -41,15 +41,21 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var fb_id: u32 = 0;
-    if (c.drmModeAddFB(
+
+    var handle = [_]u32 {creq.handle, 0, 0, 0};
+    var pitches = [_]u32 {creq.pitch, 0, 0, 0};
+    var offsets = [_]u32 {0, 0, 0, 0};
+
+    if (c.drmModeAddFB2(
         fd,
         mode.hdisplay,
         mode.vdisplay,
-        23,
-        32,
-        creq.pitch,
-        creq.handle,
+        c.DRM_FORMAT_XRGB8888,
+        &handle,
+        &pitches,
+        &offsets,
         &fb_id,
+        0,
     ) != 0) {
         return error.FailedToAddFB;
     }
