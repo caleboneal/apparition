@@ -4,7 +4,7 @@ const ghostty_vt = @import("ghostty-vt");
 const c = @import("c_graphics");
 
 pub fn main(init: std.process.Init) !void {
-    const fd = c.open("/dev/dri/card0", c.O_RDWR | c.O_CLOEXEC);
+    const fd = c.open("/dev/dri/card1", c.O_RDWR | c.O_CLOEXEC);
 
     if (fd < 0) return error.FailedToOpenDevice;
     defer _ = c.close(fd);
