@@ -1,12 +1,13 @@
 const std = @import("std");
-const Context = @import("graphics/context.zig");
+const Renderer = @import("renderer.zig");
 
 pub fn main(init: std.process.Init) !void {
-    var context = try Context.init();
-    defer context.deinit();
+    var renderer = try Renderer.init();
+    defer renderer.deinit();
 
-    context.clear(0x000000FF);
-    try context.present();
+    renderer.clear(0x000000FF);
+    renderer.fill_rect(0x0000FF00, 0, 0, 20, 20);
+    try renderer.present();
 
     std.debug.print("Rendering to screen for 5 seconds...\n", .{});
     try init.io.sleep(std.Io.Duration.fromSeconds(5), .real);
