@@ -101,12 +101,10 @@ pub fn init() !Self {
 
 pub fn fill_rect(self: *Self, color: u32, x: u32, y: u32, width: u32, height: u32) void {
     const pixels: [*]u32 = @ptrCast(@alignCast(self.framebuffer.map));
+    const fb_width = self.mode.hdisplay;
 
-    const width = self.mode.hdisplay;
-    const height = self.mode.vdisplay;
-
-    for (0..height) |h| {
-        for (0..width) |w| pixels[width * h + w] = color;
+    for (y..(y + height)) |h| {
+        for (x..(x + width)) |w| pixels[fb_width * h + w] = color;
     }
 }
 
