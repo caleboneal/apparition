@@ -8,6 +8,7 @@ const Framebuffer = struct {
     handle: u32,
     map: *anyopaque,
     size: usize,
+    stride: usize,
 };
 
 fd: c_int,
@@ -94,17 +95,39 @@ pub fn init() !Self {
             .handle = create_request.handle,
             .map = mapped_memory,
             .size = @intCast(create_request.size),
+            .stride = create_request.pitch / @sizeOf(u32),
         },
         .saved_crtc = c.drmModeGetCrtc(fd, encoder.*.crtc_id),
     };
 }
 
-pub fn fill_rect(self: *Self, color: u32, x: u32, y: u32, width: u32, height: u32) void {
-    const pixels: [*]u32 = @ptrCast(@alignCast(self.framebuffer.map));
-    const fb_width = self.mode.hdisplay;
+pub const Rect = struct {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
 
-    for (y..(y + height)) |h| {
-        for (x..(x + width)) |w| pixels[fb_width * h + w] = color;
+    pub fn clip(self: Rect, rect: Rect) Rect {
+        return .{
+            .x = @max(self.x, rect.x),
+            .y = @max(self.y, rect.y),
+            .width = @min(self.width, rect.width),
+            .height = @min(self.height, rect.height),
+        };
+    }
+};
+
+pub fn fill_rect(self: *Self, color: u32, rect: Rect) void {
+    const pixels: [*]u32 = @ptrCast(@alignCast(self.framebuffer.map));
+    const clipped_rect = rect.clip(Rect{
+        .x = 0,
+        .y = 0,
+        .width = self.mode.hdisplay,
+        .height = self.mode.vdisplay,
+    });
+
+    for (clipped_rect.y..(clipped_rect.y + clipped_rect.height)) |h| {
+        for (clipped_rect.x..(clipped_rect.x + clipped_rect.width)) |w| pixels[self.framebuffer.stride * h + w] = color;
     }
 }
 
