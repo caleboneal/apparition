@@ -17,6 +17,9 @@ pub fn build(b: *std.Build) void {
     addPkgConfigIncludes(b, c_graphics, "egl");
     addPkgConfigIncludes(b, c_graphics, "glesv2");
     addPkgConfigIncludes(b, c_graphics, "freetype2");
+    addPkgConfigIncludes(b, c_graphics, "libinput");
+    addPkgConfigIncludes(b, c_graphics, "libudev");
+    addPkgConfigIncludes(b, c_graphics, "xkbcommon");
 
     const exe = b.addExecutable(.{
         .name = "apparition",
@@ -29,11 +32,15 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.root_module.addImport("ghostty-vt", ghostty.module("ghostty-vt"));
+    exe.root_module.addCSourceFile(.{ .file = b.path("src/c_graphics.c") });
 
     exe.root_module.linkSystemLibrary("gbm", .{});
     exe.root_module.linkSystemLibrary("glesv2", .{});
     exe.root_module.linkSystemLibrary("EGL", .{});
     exe.root_module.linkSystemLibrary("freetype2", .{});
+    exe.root_module.linkSystemLibrary("input", .{});
+    exe.root_module.linkSystemLibrary("libudev", .{ .use_pkg_config = .force });
+    exe.root_module.linkSystemLibrary("xkbcommon", .{});
     exe.root_module.linkSystemLibrary("drm", .{});
 
     exe.root_module.addImport("c_graphics", c_graphics.createModule());

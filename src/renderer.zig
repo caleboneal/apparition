@@ -106,7 +106,7 @@ pub fn clear(self: *Self, color: u32) void {
     for (0..pixel_count) |i| pixels[i] = color;
 }
 
-/// Rasterize UTF-8's ASCII subset with FreeType into the current back buffer.
+/// Rasterize UTF-8 text with FreeType into the current back buffer.
 /// `baseline_y` specifies the baseline of the first line in screen pixels.
 pub fn drawText(
     self: *Self,
