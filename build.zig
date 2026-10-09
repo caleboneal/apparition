@@ -12,10 +12,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const libinput = b.addTranslateC(.{
+        .root_source_file = b.path("src/libinput-zig.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addPkgConfigIncludes(b, libinput, "libinput");
+    addPkgConfigIncludes(b, libinput, "libudev");
+
     addPkgConfigIncludes(b, c_graphics, "libdrm");
-    addPkgConfigIncludes(b, c_graphics, "gbm");
-    addPkgConfigIncludes(b, c_graphics, "egl");
-    addPkgConfigIncludes(b, c_graphics, "glesv2");
     addPkgConfigIncludes(b, c_graphics, "freetype2");
     addPkgConfigIncludes(b, c_graphics, "libinput");
     addPkgConfigIncludes(b, c_graphics, "libudev");
@@ -35,14 +40,13 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addCSourceFile(.{ .file = b.path("src/c_graphics.c") });
 
     exe.root_module.linkSystemLibrary("gbm", .{});
-    exe.root_module.linkSystemLibrary("glesv2", .{});
-    exe.root_module.linkSystemLibrary("EGL", .{});
     exe.root_module.linkSystemLibrary("freetype2", .{});
     exe.root_module.linkSystemLibrary("input", .{});
     exe.root_module.linkSystemLibrary("libudev", .{ .use_pkg_config = .force });
     exe.root_module.linkSystemLibrary("xkbcommon", .{});
     exe.root_module.linkSystemLibrary("drm", .{});
 
+    exe.root_module.addImport("libinput", libinput.createModule());
     exe.root_module.addImport("c_graphics", c_graphics.createModule());
 
     b.installArtifact(exe);
