@@ -106,6 +106,35 @@ pub fn clear(self: *Self, color: u32) void {
     for (0..pixel_count) |i| pixels[i] = color;
 }
 
+/// Rasterize UTF-8's ASCII subset with FreeType into the current back buffer.
+/// `baseline_y` specifies the baseline of the first line in screen pixels.
+pub fn drawText(
+    self: *Self,
+    font_path: [*:0]const u8,
+    text: [*:0]const u8,
+    pixel_size: u32,
+    x: i32,
+    baseline_y: i32,
+    color: u32,
+) !void {
+    const framebuffer = self.framebuffers[self.render_index];
+    const pixels: [*]u32 = @ptrCast(@alignCast(framebuffer.map));
+    if (c.apparition_draw_text(
+        pixels,
+        @intCast(framebuffer.stride),
+        self.mode.hdisplay,
+        self.mode.vdisplay,
+        font_path,
+        text,
+        pixel_size,
+        x,
+        baseline_y,
+        color,
+    ) != 0) {
+        return error.FailedToRenderText;
+    }
+}
+
 pub fn present(self: *Self) !void {
     const framebuffer = self.framebuffers[self.render_index];
 
