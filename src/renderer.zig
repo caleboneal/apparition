@@ -16,7 +16,9 @@ resources: *c.drmModeRes,
 connector: *c.drmModeConnector,
 encoder: *c.drmModeEncoder,
 mode: c.drmModeModeInfo,
-framebuffer: Framebuffer,
+framebuffers: [2]Framebuffer,
+display_index: ?usize = null,
+render_index: usize = 0,
 saved_crtc: ?*c.drmModeCrtc,
 is_modeset: bool = false,
 
@@ -44,6 +46,128 @@ pub fn init() !Self {
     errdefer c.drmModeFreeEncoder(encoder);
 
     const mode = selected_connector.*.modes.*;
+    var framebuffers: [2]Framebuffer = undefined;
+    var framebuffer_count: usize = 0;
+    errdefer for (framebuffers[0..framebuffer_count]) |framebuffer| {
+        destroyFramebuffer(fd, framebuffer);
+    };
+
+    for (&framebuffers) |*framebuffer| {
+        framebuffer.* = try createFramebuffer(fd, mode);
+        framebuffer_count += 1;
+    }
+
+    return .{
+        .fd = fd,
+        .resources = resources,
+        .connector = selected_connector,
+        .encoder = encoder,
+        .mode = mode,
+        .framebuffers = framebuffers,
+        .saved_crtc = c.drmModeGetCrtc(fd, encoder.*.crtc_id),
+    };
+}
+
+pub const Rect = struct {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+
+    pub fn clip(self: Rect, rect: Rect) Rect {
+        return .{
+            .x = @max(self.x, rect.x),
+            .y = @max(self.y, rect.y),
+            .width = @min(self.width, rect.width),
+            .height = @min(self.height, rect.height),
+        };
+    }
+};
+
+pub fn fill_rect(self: *Self, color: u32, rect: Rect) void {
+    const framebuffer = self.framebuffers[self.render_index];
+    const pixels: [*]u32 = @ptrCast(@alignCast(framebuffer.map));
+    const clipped_rect = rect.clip(Rect{
+        .x = 0,
+        .y = 0,
+        .width = self.mode.hdisplay,
+        .height = self.mode.vdisplay,
+    });
+
+    for (clipped_rect.y..(clipped_rect.y + clipped_rect.height)) |h| {
+        for (clipped_rect.x..(clipped_rect.x + clipped_rect.width)) |w| pixels[framebuffer.stride * h + w] = color;
+    }
+}
+
+pub fn clear(self: *Self, color: u32) void {
+    const framebuffer = self.framebuffers[self.render_index];
+    const pixels: [*]u32 = @ptrCast(@alignCast(framebuffer.map));
+    const pixel_count = framebuffer.size / @sizeOf(u32);
+    for (0..pixel_count) |i| pixels[i] = color;
+}
+
+pub fn present(self: *Self) !void {
+    const framebuffer = self.framebuffers[self.render_index];
+
+    if (self.display_index == null) {
+        if (c.drmModeSetCrtc(
+            self.fd,
+            self.encoder.*.crtc_id,
+            framebuffer.id,
+            0,
+            0,
+            &self.connector.*.connector_id,
+            1,
+            &self.mode,
+        ) != 0) {
+            return error.FailedToSetCrtc;
+        }
+        self.is_modeset = true;
+    } else {
+        if (c.drmModePageFlip(
+            self.fd,
+            self.encoder.*.crtc_id,
+            framebuffer.id,
+            c.DRM_MODE_PAGE_FLIP_EVENT,
+            null,
+        ) != 0) {
+            return error.FailedToQueuePageFlip;
+        }
+        if (c.apparition_wait_for_page_flip(self.fd) != 0) {
+            return error.FailedToWaitForPageFlip;
+        }
+    }
+
+    self.display_index = self.render_index;
+    self.render_index = (self.render_index + 1) % self.framebuffers.len;
+}
+
+pub fn deinit(self: *Self) void {
+    if (self.is_modeset) self.restoreCrtc();
+    if (self.saved_crtc) |saved_crtc| c.drmModeFreeCrtc(saved_crtc);
+
+    for (self.framebuffers) |framebuffer| destroyFramebuffer(self.fd, framebuffer);
+    c.drmModeFreeEncoder(self.encoder);
+    c.drmModeFreeConnector(self.connector);
+    c.drmModeFreeResources(self.resources);
+    _ = c.close(self.fd);
+}
+
+fn restoreCrtc(self: *Self) void {
+    const saved_crtc = self.saved_crtc orelse return;
+    _ = c.drmModeSetCrtc(
+        self.fd,
+        saved_crtc.*.crtc_id,
+        saved_crtc.*.buffer_id,
+        saved_crtc.*.x,
+        saved_crtc.*.y,
+        &self.connector.*.connector_id,
+        1,
+        &saved_crtc.*.mode,
+    );
+}
+
+fn createFramebuffer(fd: c_int, mode: c.drmModeModeInfo) !Framebuffer {
     var create_request = std.mem.zeroes(c.drm_mode_create_dumb);
     create_request.width = mode.hdisplay;
     create_request.height = mode.vdisplay;
@@ -85,99 +209,18 @@ pub fn init() !Self {
     errdefer _ = c.munmap(mapped_memory, @intCast(create_request.size));
 
     return .{
-        .fd = fd,
-        .resources = resources,
-        .connector = selected_connector,
-        .encoder = encoder,
-        .mode = mode,
-        .framebuffer = .{
-            .id = framebuffer_id,
-            .handle = create_request.handle,
-            .map = mapped_memory,
-            .size = @intCast(create_request.size),
-            .stride = create_request.pitch / @sizeOf(u32),
-        },
-        .saved_crtc = c.drmModeGetCrtc(fd, encoder.*.crtc_id),
+        .id = framebuffer_id,
+        .handle = create_request.handle,
+        .map = mapped_memory,
+        .size = @intCast(create_request.size),
+        .stride = create_request.pitch / @sizeOf(u32),
     };
 }
 
-pub const Rect = struct {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-
-    pub fn clip(self: Rect, rect: Rect) Rect {
-        return .{
-            .x = @max(self.x, rect.x),
-            .y = @max(self.y, rect.y),
-            .width = @min(self.width, rect.width),
-            .height = @min(self.height, rect.height),
-        };
-    }
-};
-
-pub fn fill_rect(self: *Self, color: u32, rect: Rect) void {
-    const pixels: [*]u32 = @ptrCast(@alignCast(self.framebuffer.map));
-    const clipped_rect = rect.clip(Rect{
-        .x = 0,
-        .y = 0,
-        .width = self.mode.hdisplay,
-        .height = self.mode.vdisplay,
-    });
-
-    for (clipped_rect.y..(clipped_rect.y + clipped_rect.height)) |h| {
-        for (clipped_rect.x..(clipped_rect.x + clipped_rect.width)) |w| pixels[self.framebuffer.stride * h + w] = color;
-    }
-}
-
-pub fn clear(self: *Self, color: u32) void {
-    const pixels: [*]u32 = @ptrCast(@alignCast(self.framebuffer.map));
-    const pixel_count = self.framebuffer.size / @sizeOf(u32);
-    for (0..pixel_count) |i| pixels[i] = color;
-}
-
-pub fn present(self: *Self) !void {
-    if (c.drmModeSetCrtc(
-        self.fd,
-        self.encoder.*.crtc_id,
-        self.framebuffer.id,
-        0,
-        0,
-        &self.connector.*.connector_id,
-        1,
-        &self.mode,
-    ) != 0) {
-        return error.FailedToSetCrtc;
-    }
-    self.is_modeset = true;
-}
-
-pub fn deinit(self: *Self) void {
-    if (self.is_modeset) self.restoreCrtc();
-    if (self.saved_crtc) |saved_crtc| c.drmModeFreeCrtc(saved_crtc);
-
-    _ = c.munmap(self.framebuffer.map, self.framebuffer.size);
-    _ = c.drmModeRmFB(self.fd, self.framebuffer.id);
-    destroyDumbBuffer(self.fd, self.framebuffer.handle);
-    c.drmModeFreeEncoder(self.encoder);
-    c.drmModeFreeConnector(self.connector);
-    c.drmModeFreeResources(self.resources);
-    _ = c.close(self.fd);
-}
-
-fn restoreCrtc(self: *Self) void {
-    const saved_crtc = self.saved_crtc orelse return;
-    _ = c.drmModeSetCrtc(
-        self.fd,
-        saved_crtc.*.crtc_id,
-        saved_crtc.*.buffer_id,
-        saved_crtc.*.x,
-        saved_crtc.*.y,
-        &self.connector.*.connector_id,
-        1,
-        &saved_crtc.*.mode,
-    );
+fn destroyFramebuffer(fd: c_int, framebuffer: Framebuffer) void {
+    _ = c.munmap(framebuffer.map, framebuffer.size);
+    _ = c.drmModeRmFB(fd, framebuffer.id);
+    destroyDumbBuffer(fd, framebuffer.handle);
 }
 
 fn destroyDumbBuffer(fd: c_int, handle: u32) void {

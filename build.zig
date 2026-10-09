@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     addPkgConfigIncludes(b, c_graphics, "gbm");
     addPkgConfigIncludes(b, c_graphics, "egl");
     addPkgConfigIncludes(b, c_graphics, "glesv2");
+    addPkgConfigIncludes(b, c_graphics, "freetype2");
 
     const exe = b.addExecutable(.{
         .name = "apparition",
@@ -32,6 +33,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("gbm", .{});
     exe.root_module.linkSystemLibrary("glesv2", .{});
     exe.root_module.linkSystemLibrary("EGL", .{});
+    exe.root_module.linkSystemLibrary("freetype2", .{});
     exe.root_module.linkSystemLibrary("drm", .{});
 
     exe.root_module.addImport("c_graphics", c_graphics.createModule());

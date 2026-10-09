@@ -25,6 +25,7 @@
               pkgs.pkg-config
               pkgs.libdrm
               pkgs.libgbm
+              pkgs.freetype
               pkgs.libGL # Provides EGL and OpenGL headers
             ];
           };
