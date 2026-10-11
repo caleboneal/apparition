@@ -6,11 +6,6 @@ pub fn build(b: *std.Build) void {
 
     // Deps
     const ghostty = b.dependency("ghostty", .{});
-    const c_graphics = b.addTranslateC(.{
-        .root_source_file = b.path("src/c_graphics.h"),
-        .target = target,
-        .optimize = optimize,
-    });
 
     const libdrm = b.addTranslateC(.{
         .root_source_file = b.path("src/c/libdrm.h"),
@@ -34,12 +29,6 @@ pub fn build(b: *std.Build) void {
     });
     addPkgConfigIncludes(b, freetype, "freetype2");
 
-    addPkgConfigIncludes(b, c_graphics, "libdrm");
-    addPkgConfigIncludes(b, c_graphics, "freetype2");
-    addPkgConfigIncludes(b, c_graphics, "libinput");
-    addPkgConfigIncludes(b, c_graphics, "libudev");
-    addPkgConfigIncludes(b, c_graphics, "xkbcommon");
-
     const exe = b.addExecutable(.{
         .name = "apparition",
         .root_module = b.createModule(.{
@@ -62,7 +51,6 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("libinput", libinput.createModule());
     exe.root_module.addImport("libdrm", libdrm.createModule());
     exe.root_module.addImport("freetype", freetype.createModule());
-    exe.root_module.addImport("c_graphics", c_graphics.createModule());
 
     b.installArtifact(exe);
 

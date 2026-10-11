@@ -1,25 +1,29 @@
 const std = @import("std");
+const linux = std.os.linux;
 
 pub const Keyboard = @import("input/keyboard.zig");
 
 const libinput = @import("libinput");
-
-extern "c" fn open(path: [*c]const u8, flags: c_int, ...) c_int;
-extern "c" fn close(fd: c_int) c_int;
 
 const Self = @This();
 
 context: *libinput.libinput,
 fd: c_int,
 
+const Event = union(enum) {
+    text: []const u8,
+    backspace,
+    quit,
+};
+
 fn openRestricted(path: [*c]const u8, flags: c_int, user_data: ?*anyopaque) callconv(.c) c_int {
     _ = user_data;
-    return open(path, flags, @as(c_int, 0));
+    return @intCast(linux.open(path, @bitCast(flags), @as(c_int, 0)));
 }
 
 fn closeRestricted(fd: c_int, user_data: ?*anyopaque) callconv(.c) void {
     _ = user_data;
-    _ = close(fd);
+    _ = linux.close(fd);
 }
 
 const interface = libinput.libinput_interface{
@@ -89,4 +93,26 @@ pub fn wait(self: *Self) !void {
         std.log.err("Poll error: {}\n", .{err});
         return error.PollError;
     };
+}
+
+pub fn next(self: *Self, buffer: []u8) !?Event {
+    _ = buffer;
+
+    const event = libinput.libinput_get_event(self.context) orelse return error.FailedToGetEvent;
+    defer libinput.libinput_event_destroy(event);
+
+    if (libinput.libinput_event_get_type(event) == libinput.LIBINPUT_EVENT_KEYBOARD_KEY) {
+        const kbd_event = libinput.libinput_event_get_keyboard_event(event);
+
+        const key = libinput.libinput_event_keyboard_get_key(kbd_event);
+        const state = libinput.libinput_event_keyboard_get_key_state(kbd_event);
+
+        if (state == libinput.LIBINPUT_KEY_STATE_PRESSED) {
+            return switch (key) {
+                0 => .quit,
+                else => return null,
+            };
+        }
+    }
+    return null;
 }

@@ -26,7 +26,11 @@ saved_crtc: ?*libdrm.drmModeCrtc,
 is_modeset: bool = false,
 
 pub fn init() !Self {
-    const fd = linux.open("/dev/dri/card1", .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+    const fd: c_int = @intCast(linux.open(
+        "/dev/dri/card1",
+        .{ .ACCMODE = .RDWR, .CLOEXEC = true },
+        0,
+    ));
     if (fd < 0) return error.FailedToOpenDevice;
     errdefer _ = linux.close(fd);
 
@@ -115,7 +119,7 @@ pub fn clear(self: *Self, color: u32) void {
 }
 
 fn blendPixel(bg: u32, fg: u32, alpha: u8) u32 {
-    const inverse_alpha = 256 - alpha;
+    const inverse_alpha = 255 - alpha;
     const red = (((fg >> 16) ^ 0xFF) * alpha + ((bg >> 16) & 0xFF) * inverse_alpha) / 255;
     const green = (((fg >> 8) ^ 0xFF) * alpha + ((bg >> 8) & 0xFF) * inverse_alpha) / 255;
     const blue = ((fg ^ 0xFF) * alpha + (bg & 0xFF) * inverse_alpha) / 255;
@@ -140,19 +144,19 @@ pub fn drawText(
     const stride: u32 = @intCast(framebuffer.stride);
 
     var library: freetype.FT_Library = undefined;
-    const face: freetype.FT_Face = undefined;
+    var face: freetype.FT_Face = undefined;
     if (freetype.FT_Init_FreeType(&library) != 0) return error.FailedToInitializeFreeType;
-    defer freetype.FT_Done_FreeType(library);
+    defer _ = freetype.FT_Done_FreeType(library);
 
     if (freetype.FT_New_Face(library, font_path, 0, &face) != 0) return error.FailedToLoadTypeface;
-    defer freetype.FT_Done_Face(face);
+    defer _ = freetype.FT_Done_Face(face);
 
     if (freetype.FT_Set_Pixel_Sizes(face, 0, pixel_size) != 0) return error.FailedToSetPixelSizes;
 
     var pen_x = x;
     var pen_y = baseline_y;
 
-    var utf8_view = std.unicode.Utf8View.init(text) orelse return error.InvalidUtf8;
+    var utf8_view = std.unicode.Utf8View.init(std.mem.span(text)) catch return error.InvalidUtf8;
     var iter = utf8_view.iterator();
 
     while (iter.nextCodepoint()) |codepoint| {
@@ -243,7 +247,7 @@ fn page_flip_handler(
     frame: c_uint,
     sec: c_uint,
     usec: c_uint,
-    user_data: *anyopaque,
+    user_data: ?*anyopaque,
 ) callconv(.c) void {
     _ = fd;
     _ = frame;
@@ -317,13 +321,13 @@ fn createFramebuffer(fd: c_int, mode: libdrm.drmModeModeInfo) !Framebuffer {
         null,
         create_request.size,
         linux.PROT{ .READ = true, .WRITE = true },
-        linux.MAP_TYPE.SHARED,
+        .{ .TYPE = linux.MAP_TYPE.SHARED },
         fd,
         offset,
     );
-    if (map == std.c.MAP_FAILED) return error.MmapFailed;
-    const mapped_memory: *anyopaque = @ptrCast(map);
-    errdefer _ = linux.munmap(mapped_memory, @intCast(create_request.size));
+    if (map == std.math.maxInt(usize)) return error.MmapFailed;
+    const mapped_memory: *anyopaque = @ptrFromInt(map);
+    errdefer _ = linux.munmap(@ptrCast(mapped_memory), @intCast(create_request.size));
 
     return .{
         .id = framebuffer_id,
@@ -335,7 +339,7 @@ fn createFramebuffer(fd: c_int, mode: libdrm.drmModeModeInfo) !Framebuffer {
 }
 
 fn destroyFramebuffer(fd: c_int, framebuffer: Framebuffer) void {
-    _ = linux.munmap(framebuffer.map, framebuffer.size);
+    _ = linux.munmap(@ptrCast(framebuffer.map), framebuffer.size);
     _ = libdrm.drmModeRmFB(fd, framebuffer.id);
     destroyDumbBuffer(fd, framebuffer.handle);
 }
