@@ -1,5 +1,8 @@
 const std = @import("std");
-const c = @import("c_graphics");
+const linux = std.os.linux;
+
+const libdrm = @import("libdrm");
+const freetype = @import("freetype");
 
 const Self = @This();
 
@@ -12,38 +15,41 @@ const Framebuffer = struct {
 };
 
 fd: c_int,
-resources: *c.drmModeRes,
-connector: *c.drmModeConnector,
-encoder: *c.drmModeEncoder,
-mode: c.drmModeModeInfo,
+resources: *libdrm.drmModeRes,
+connector: *libdrm.drmModeConnector,
+encoder: *libdrm.drmModeEncoder,
+mode: libdrm.drmModeModeInfo,
 framebuffers: [2]Framebuffer,
 display_index: ?usize = null,
 render_index: usize = 0,
-saved_crtc: ?*c.drmModeCrtc,
+saved_crtc: ?*libdrm.drmModeCrtc,
 is_modeset: bool = false,
 
 pub fn init() !Self {
-    const fd = c.open("/dev/dri/card1", c.O_RDWR | c.O_CLOEXEC);
+    const fd = linux.open("/dev/dri/card1", .{ .ACCMODE = .RDWR, .CLOEXEC = true });
     if (fd < 0) return error.FailedToOpenDevice;
-    errdefer _ = c.close(fd);
+    errdefer _ = linux.close(fd);
 
-    const resources = c.drmModeGetResources(fd) orelse return error.FailedToGetResources;
-    errdefer c.drmModeFreeResources(resources);
+    const resources = libdrm.drmModeGetResources(fd) orelse return error.FailedToGetResources;
+    errdefer libdrm.drmModeFreeResources(resources);
 
-    var connector: ?*c.drmModeConnector = null;
+    var connector: ?*libdrm.drmModeConnector = null;
     for (0..@intCast(resources.*.count_connectors)) |i| {
-        const candidate = c.drmModeGetConnector(fd, resources.*.connectors[i]) orelse continue;
-        if (candidate.*.connection == c.DRM_MODE_CONNECTED and candidate.*.count_modes > 0) {
+        const candidate = libdrm.drmModeGetConnector(fd, resources.*.connectors[i]) orelse continue;
+        if (candidate.*.connection == libdrm.DRM_MODE_CONNECTED and candidate.*.count_modes > 0) {
             connector = candidate;
             break;
         }
-        c.drmModeFreeConnector(candidate);
+        libdrm.drmModeFreeConnector(candidate);
     }
     const selected_connector = connector orelse return error.NoConnectedDisplay;
-    errdefer c.drmModeFreeConnector(selected_connector);
+    errdefer libdrm.drmModeFreeConnector(selected_connector);
 
-    const encoder = c.drmModeGetEncoder(fd, selected_connector.*.encoder_id) orelse return error.NoEncoder;
-    errdefer c.drmModeFreeEncoder(encoder);
+    const encoder = libdrm.drmModeGetEncoder(
+        fd,
+        selected_connector.*.encoder_id,
+    ) orelse return error.NoEncoder;
+    errdefer libdrm.drmModeFreeEncoder(encoder);
 
     const mode = selected_connector.*.modes.*;
     var framebuffers: [2]Framebuffer = undefined;
@@ -64,7 +70,7 @@ pub fn init() !Self {
         .encoder = encoder,
         .mode = mode,
         .framebuffers = framebuffers,
-        .saved_crtc = c.drmModeGetCrtc(fd, encoder.*.crtc_id),
+        .saved_crtc = libdrm.drmModeGetCrtc(fd, encoder.*.crtc_id),
     };
 }
 
@@ -95,7 +101,9 @@ pub fn fill_rect(self: *Self, color: u32, rect: Rect) void {
     });
 
     for (clipped_rect.y..(clipped_rect.y + clipped_rect.height)) |h| {
-        for (clipped_rect.x..(clipped_rect.x + clipped_rect.width)) |w| pixels[framebuffer.stride * h + w] = color;
+        for (clipped_rect.x..(clipped_rect.x + clipped_rect.width)) |w| {
+            pixels[framebuffer.stride * h + w] = color;
+        }
     }
 }
 
@@ -104,6 +112,14 @@ pub fn clear(self: *Self, color: u32) void {
     const pixels: [*]u32 = @ptrCast(@alignCast(framebuffer.map));
     const pixel_count = framebuffer.size / @sizeOf(u32);
     for (0..pixel_count) |i| pixels[i] = color;
+}
+
+fn blendPixel(bg: u32, fg: u32, alpha: u8) u32 {
+    const inverse_alpha = 256 - alpha;
+    const red = (((fg >> 16) ^ 0xFF) * alpha + ((bg >> 16) & 0xFF) * inverse_alpha) / 255;
+    const green = (((fg >> 8) ^ 0xFF) * alpha + ((bg >> 8) & 0xFF) * inverse_alpha) / 255;
+    const blue = ((fg ^ 0xFF) * alpha + (bg & 0xFF) * inverse_alpha) / 255;
+    return (red << 16) | (green << 8) | blue;
 }
 
 /// Rasterize UTF-8 text with FreeType into the current back buffer.
@@ -119,19 +135,63 @@ pub fn drawText(
 ) !void {
     const framebuffer = self.framebuffers[self.render_index];
     const pixels: [*]u32 = @ptrCast(@alignCast(framebuffer.map));
-    if (c.apparition_draw_text(
-        pixels,
-        @intCast(framebuffer.stride),
-        self.mode.hdisplay,
-        self.mode.vdisplay,
-        font_path,
-        text,
-        pixel_size,
-        x,
-        baseline_y,
-        color,
-    ) != 0) {
-        return error.FailedToRenderText;
+    const height = self.mode.vdisplay;
+    const width = self.mode.hdisplay;
+    const stride: u32 = @intCast(framebuffer.stride);
+
+    var library: freetype.FT_Library = undefined;
+    const face: freetype.FT_Face = undefined;
+    if (freetype.FT_Init_FreeType(&library) != 0) return error.FailedToInitializeFreeType;
+    defer freetype.FT_Done_FreeType(library);
+
+    if (freetype.FT_New_Face(library, font_path, 0, &face) != 0) return error.FailedToLoadTypeface;
+    defer freetype.FT_Done_Face(face);
+
+    if (freetype.FT_Set_Pixel_Sizes(face, 0, pixel_size) != 0) return error.FailedToSetPixelSizes;
+
+    var pen_x = x;
+    var pen_y = baseline_y;
+
+    var utf8_view = std.unicode.Utf8View.init(text) orelse return error.InvalidUtf8;
+    var iter = utf8_view.iterator();
+
+    while (iter.nextCodepoint()) |codepoint| {
+        if (codepoint == '\n') {
+            pen_x = x;
+
+            pen_y += @as(i32, @intCast(face.*.size.*.metrics.height >> 6));
+            continue;
+        }
+
+        if (freetype.FT_Load_Char(face, codepoint, freetype.FT_LOAD_RENDER) != 0) {
+            return error.GlyphLoadFailed;
+        }
+
+        const glyph = face.*.glyph;
+        const bitmap = &glyph.*.bitmap;
+
+        var row: u32 = 0;
+        while (row < bitmap.*.rows) : (row += 1) {
+            const destination_y = pen_y - glyph.*.bitmap_top + @as(i32, @intCast(row));
+
+            if (destination_y < 0 or destination_y >= height) continue;
+
+            var column: u32 = 0;
+            while (column < bitmap.*.width) : (column += 1) {
+                const destination_x = pen_x + glyph.*.bitmap_left + @as(i32, @intCast(column));
+
+                if (destination_x < 0 or destination_x >= width) continue;
+
+                const buffer_idx = row * @as(u32, @intCast(bitmap.*.pitch)) + column;
+                const alpha = bitmap.*.buffer[buffer_idx];
+
+                const dest_idx = @as(u32, @intCast(destination_y)) * stride + @as(u32, @intCast(destination_x));
+
+                pixels[dest_idx] = blendPixel(pixels[dest_idx], color, alpha);
+            }
+        }
+
+        pen_x += @as(i32, @intCast(glyph.*.advance.x >> 6));
     }
 }
 
@@ -139,7 +199,7 @@ pub fn present(self: *Self) !void {
     const framebuffer = self.framebuffers[self.render_index];
 
     if (self.display_index == null) {
-        if (c.drmModeSetCrtc(
+        if (libdrm.drmModeSetCrtc(
             self.fd,
             self.encoder.*.crtc_id,
             framebuffer.id,
@@ -153,16 +213,16 @@ pub fn present(self: *Self) !void {
         }
         self.is_modeset = true;
     } else {
-        if (c.drmModePageFlip(
+        if (libdrm.drmModePageFlip(
             self.fd,
             self.encoder.*.crtc_id,
             framebuffer.id,
-            c.DRM_MODE_PAGE_FLIP_EVENT,
+            libdrm.DRM_MODE_PAGE_FLIP_EVENT,
             null,
         ) != 0) {
             return error.FailedToQueuePageFlip;
         }
-        if (c.apparition_wait_for_page_flip(self.fd) != 0) {
+        if (wait_for_page_flip(self.fd) != 0) {
             return error.FailedToWaitForPageFlip;
         }
     }
@@ -171,20 +231,41 @@ pub fn present(self: *Self) !void {
     self.render_index = (self.render_index + 1) % self.framebuffers.len;
 }
 
+fn wait_for_page_flip(fd: c_int) i32 {
+    var event_context = std.mem.zeroes(libdrm.drmEventContext);
+    event_context.version = libdrm.DRM_EVENT_CONTEXT_VERSION;
+    event_context.page_flip_handler = &page_flip_handler;
+    return @intCast(libdrm.drmHandleEvent(fd, &event_context));
+}
+
+fn page_flip_handler(
+    fd: c_int,
+    frame: c_uint,
+    sec: c_uint,
+    usec: c_uint,
+    user_data: *anyopaque,
+) callconv(.c) void {
+    _ = fd;
+    _ = frame;
+    _ = sec;
+    _ = usec;
+    _ = user_data;
+}
+
 pub fn deinit(self: *Self) void {
     if (self.is_modeset) self.restoreCrtc();
-    if (self.saved_crtc) |saved_crtc| c.drmModeFreeCrtc(saved_crtc);
+    if (self.saved_crtc) |saved_crtc| libdrm.drmModeFreeCrtc(saved_crtc);
 
     for (self.framebuffers) |framebuffer| destroyFramebuffer(self.fd, framebuffer);
-    c.drmModeFreeEncoder(self.encoder);
-    c.drmModeFreeConnector(self.connector);
-    c.drmModeFreeResources(self.resources);
-    _ = c.close(self.fd);
+    libdrm.drmModeFreeEncoder(self.encoder);
+    libdrm.drmModeFreeConnector(self.connector);
+    libdrm.drmModeFreeResources(self.resources);
+    _ = linux.close(self.fd);
 }
 
 fn restoreCrtc(self: *Self) void {
     const saved_crtc = self.saved_crtc orelse return;
-    _ = c.drmModeSetCrtc(
+    _ = libdrm.drmModeSetCrtc(
         self.fd,
         saved_crtc.*.crtc_id,
         saved_crtc.*.buffer_id,
@@ -196,12 +277,12 @@ fn restoreCrtc(self: *Self) void {
     );
 }
 
-fn createFramebuffer(fd: c_int, mode: c.drmModeModeInfo) !Framebuffer {
-    var create_request = std.mem.zeroes(c.drm_mode_create_dumb);
+fn createFramebuffer(fd: c_int, mode: libdrm.drmModeModeInfo) !Framebuffer {
+    var create_request = std.mem.zeroes(libdrm.drm_mode_create_dumb);
     create_request.width = mode.hdisplay;
     create_request.height = mode.vdisplay;
     create_request.bpp = 32;
-    if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_CREATE_DUMB, &create_request) < 0) {
+    if (libdrm.drmIoctl(fd, libdrm.DRM_IOCTL_MODE_CREATE_DUMB, &create_request) < 0) {
         return error.FailedToCreateDumbBuffer;
     }
     errdefer destroyDumbBuffer(fd, create_request.handle);
@@ -210,11 +291,11 @@ fn createFramebuffer(fd: c_int, mode: c.drmModeModeInfo) !Framebuffer {
     var handles = [_]u32{ create_request.handle, 0, 0, 0 };
     var pitches = [_]u32{ create_request.pitch, 0, 0, 0 };
     var offsets = [_]u32{ 0, 0, 0, 0 };
-    if (c.drmModeAddFB2(
+    if (libdrm.drmModeAddFB2(
         fd,
         mode.hdisplay,
         mode.vdisplay,
-        c.DRM_FORMAT_XRGB8888,
+        libdrm.DRM_FORMAT_XRGB8888,
         &handles,
         &pitches,
         &offsets,
@@ -223,19 +304,26 @@ fn createFramebuffer(fd: c_int, mode: c.drmModeModeInfo) !Framebuffer {
     ) != 0) {
         return error.FailedToAddFB;
     }
-    errdefer _ = c.drmModeRmFB(fd, framebuffer_id);
+    errdefer _ = libdrm.drmModeRmFB(fd, framebuffer_id);
 
-    var map_request = std.mem.zeroes(c.drm_mode_map_dumb);
+    var map_request = std.mem.zeroes(libdrm.drm_mode_map_dumb);
     map_request.handle = create_request.handle;
-    if (c.drmIoctl(fd, c.DRM_IOCTL_MODE_MAP_DUMB, &map_request) < 0) {
+    if (libdrm.drmIoctl(fd, libdrm.DRM_IOCTL_MODE_MAP_DUMB, &map_request) < 0) {
         return error.FailedToMapDumbBuffer;
     }
 
-    const offset = @as(c.off_t, @intCast(map_request.offset));
-    const map = c.mmap(null, create_request.size, c.PROT_READ | c.PROT_WRITE, c.MAP_SHARED, fd, offset);
-    if (map == c.MAP_FAILED) return error.MmapFailed;
+    const offset = @as(libdrm.off_t, @intCast(map_request.offset));
+    const map = linux.mmap(
+        null,
+        create_request.size,
+        linux.PROT{ .READ = true, .WRITE = true },
+        linux.MAP_TYPE.SHARED,
+        fd,
+        offset,
+    );
+    if (map == std.c.MAP_FAILED) return error.MmapFailed;
     const mapped_memory: *anyopaque = @ptrCast(map);
-    errdefer _ = c.munmap(mapped_memory, @intCast(create_request.size));
+    errdefer _ = linux.munmap(mapped_memory, @intCast(create_request.size));
 
     return .{
         .id = framebuffer_id,
@@ -247,13 +335,13 @@ fn createFramebuffer(fd: c_int, mode: c.drmModeModeInfo) !Framebuffer {
 }
 
 fn destroyFramebuffer(fd: c_int, framebuffer: Framebuffer) void {
-    _ = c.munmap(framebuffer.map, framebuffer.size);
-    _ = c.drmModeRmFB(fd, framebuffer.id);
+    _ = linux.munmap(framebuffer.map, framebuffer.size);
+    _ = libdrm.drmModeRmFB(fd, framebuffer.id);
     destroyDumbBuffer(fd, framebuffer.handle);
 }
 
 fn destroyDumbBuffer(fd: c_int, handle: u32) void {
-    var destroy_request = std.mem.zeroes(c.drm_mode_destroy_dumb);
+    var destroy_request = std.mem.zeroes(libdrm.drm_mode_destroy_dumb);
     destroy_request.handle = handle;
-    _ = c.drmIoctl(fd, c.DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_request);
+    _ = libdrm.drmIoctl(fd, libdrm.DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_request);
 }

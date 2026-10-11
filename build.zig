@@ -12,13 +12,27 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const libdrm = b.addTranslateC(.{
+        .root_source_file = b.path("src/c/libdrm.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addPkgConfigIncludes(b, libdrm, "libdrm");
+
     const libinput = b.addTranslateC(.{
-        .root_source_file = b.path("src/libinput-zig.h"),
+        .root_source_file = b.path("src/c/libinput.h"),
         .target = target,
         .optimize = optimize,
     });
     addPkgConfigIncludes(b, libinput, "libinput");
     addPkgConfigIncludes(b, libinput, "libudev");
+
+    const freetype = b.addTranslateC(.{
+        .root_source_file = b.path("src/c/freetype.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addPkgConfigIncludes(b, freetype, "freetype2");
 
     addPkgConfigIncludes(b, c_graphics, "libdrm");
     addPkgConfigIncludes(b, c_graphics, "freetype2");
@@ -37,7 +51,6 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.root_module.addImport("ghostty-vt", ghostty.module("ghostty-vt"));
-    exe.root_module.addCSourceFile(.{ .file = b.path("src/c_graphics.c") });
 
     exe.root_module.linkSystemLibrary("gbm", .{});
     exe.root_module.linkSystemLibrary("freetype2", .{});
@@ -47,6 +60,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("drm", .{});
 
     exe.root_module.addImport("libinput", libinput.createModule());
+    exe.root_module.addImport("libdrm", libdrm.createModule());
+    exe.root_module.addImport("freetype", freetype.createModule());
     exe.root_module.addImport("c_graphics", c_graphics.createModule());
 
     b.installArtifact(exe);

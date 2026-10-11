@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const Keyboard = @import("input/keyboard.zig");
+
 const libinput = @import("libinput");
 
 extern "c" fn open(path: [*c]const u8, flags: c_int, ...) c_int;
