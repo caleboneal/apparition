@@ -120,10 +120,19 @@ pub fn clear(self: *Self, color: u32) void {
 
 fn blendPixel(bg: u32, fg: u32, alpha: u8) u32 {
     const inverse_alpha = 255 - alpha;
-    const red = (((fg >> 16) ^ 0xFF) * alpha + ((bg >> 16) & 0xFF) * inverse_alpha) / 255;
-    const green = (((fg >> 8) ^ 0xFF) * alpha + ((bg >> 8) & 0xFF) * inverse_alpha) / 255;
-    const blue = ((fg ^ 0xFF) * alpha + (bg & 0xFF) * inverse_alpha) / 255;
+    const red = (((fg >> 16) & 0xFF) * alpha + ((bg >> 16) & 0xFF) * inverse_alpha) / 255;
+    const green = (((fg >> 8) & 0xFF) * alpha + ((bg >> 8) & 0xFF) * inverse_alpha) / 255;
+    const blue = ((fg & 0xFF) * alpha + (bg & 0xFF) * inverse_alpha) / 255;
     return (red << 16) | (green << 8) | blue;
+}
+
+test "blendPixel blends RGB channels independently" {
+    try std.testing.expectEqual(@as(u32, 0x123456), blendPixel(0x123456, 0xABCDEF, 0));
+    try std.testing.expectEqual(@as(u32, 0xABCDEF), blendPixel(0x123456, 0xABCDEF, 255));
+    try std.testing.expectEqual(@as(u32, 0x808080), blendPixel(0x000000, 0xFFFFFF, 128));
+    try std.testing.expectEqual(@as(u32, 0x7F0080), blendPixel(0xFF0000, 0x0000FF, 128));
+    try std.testing.expectEqual(@as(u32, 0x123456), blendPixel(0x123456, 0x123456, 128));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFF), blendPixel(0xFFFFFFFF, 0xFFFFFFFF, 128));
 }
 
 /// Rasterize UTF-8 text with FreeType into the current back buffer.
