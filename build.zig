@@ -66,7 +66,11 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Helper function to parse pkg-config include directories and register them
-fn addPkgConfigIncludes(b: *std.Build, translate_c: *std.Build.Step.TranslateC, lib_name: []const u8) void {
+fn addPkgConfigIncludes(
+    b: *std.Build,
+    translate_c: *std.Build.Step.TranslateC,
+    lib_name: []const u8,
+) void {
     // Run pkg-config to extract compilation flags for the given package
     const flags_raw = b.run(&.{ "pkg-config", "--cflags-only-I", lib_name });
     const flags = std.mem.trim(u8, flags_raw, " \n\r\t");
