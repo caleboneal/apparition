@@ -24,4 +24,10 @@ pub fn main(init: std.process.Init) !void {
     @memset(&buf, 0);
 
     _ = try term.printAttributes(&buf);
+
+    renderer.clear(0x00000000);
+    try renderer.drawText(@ptrCast(&config.font_path), @ptrCast(&buf), 20, 48, 96, 0x00FFFFFF);
+    try renderer.present();
+
+    while (true) {}
 }
