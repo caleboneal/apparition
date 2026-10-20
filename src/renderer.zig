@@ -27,7 +27,7 @@ is_modeset: bool = false,
 
 pub fn init() !Self {
     const fd: c_int = @intCast(linux.open(
-        "/dev/dri/card1",
+        "/dev/dri/card0",
         .{ .ACCMODE = .RDWR, .CLOEXEC = true },
         0,
     ));
