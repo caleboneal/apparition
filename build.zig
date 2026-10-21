@@ -47,12 +47,18 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("libudev", .{ .use_pkg_config = .force });
     exe.root_module.linkSystemLibrary("xkbcommon", .{});
     exe.root_module.linkSystemLibrary("drm", .{});
+    exe.root_module.linkSystemLibrary("util", .{});
 
     exe.root_module.addImport("libinput", libinput.createModule());
     exe.root_module.addImport("libdrm", libdrm.createModule());
     exe.root_module.addImport("freetype", freetype.createModule());
 
     b.installArtifact(exe);
+
+    const tests = b.addTest(.{ .root_module = exe.root_module });
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run terminal, keyboard, and renderer tests");
+    test_step.dependOn(&run_tests.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
