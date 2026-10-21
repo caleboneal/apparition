@@ -39,7 +39,12 @@ pub fn main(init: std.process.Init) !void {
     for ([_]c_int{ c.SIGINT, c.SIGTERM, c.SIGHUP }) |sig| {
         _ = c.signal(sig, &stop);
     }
-    _ = c.signal(c.SIGPIPE, c.SIG_IGN);
+    // C's SIG_IGN is address 1, not an aligned ARM function pointer.
+    std.posix.sigaction(.PIPE, &.{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    }, null);
 
     var renderer = try Renderer.init();
     defer renderer.deinit();
