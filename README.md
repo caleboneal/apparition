@@ -27,7 +27,13 @@ layout, configurable through `XKB_DEFAULT_*` environment variables.
 
 Use `exit` or Ctrl-D at an empty shell prompt to close the terminal. Normal
 shutdown restores the previous display and console keyboard modes and reaps
-the shell. The event loop polls for activity instead of busy-spinning.
+the shell. The event loop polls PTY, input, and pending DRM page-flip events
+instead of busy-spinning or blocking on vblank. Output updates are coalesced
+at the display refresh rate (60 Hz if the mode does not report one).
+
+Rendering caches glyph masks for the configured font size, uses bulk pixel
+fills, and skips redundant default-background fills. Frames still redraw the
+whole visible grid; dirty-row rendering is not yet implemented.
 
 This is still rudimentary: no key autorepeat, scrollback UI, mouse input,
 clipboard, IME/compose, font fallback, grapheme shaping, or display hotplug/

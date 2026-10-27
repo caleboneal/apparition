@@ -33,6 +33,32 @@ const Session = struct {
     }
 };
 
+const FramePacer = struct {
+    interval_ns: u64,
+    next_frame_ns: i96,
+    dirty: bool = false,
+
+    fn ready(self: FramePacer, now_ns: i96, flip_pending: bool) bool {
+        return self.dirty and !flip_pending and now_ns >= self.next_frame_ns;
+    }
+
+    fn timeoutMs(self: FramePacer, now_ns: i96, flip_pending: bool) c_int {
+        // Keep checking for shell exit even when descendants hold the PTY open.
+        if (!self.dirty or flip_pending) return 100;
+        const remaining = self.next_frame_ns - now_ns;
+        if (remaining <= 0) return 0;
+        // Round up so sub-millisecond waits do not become busy polling.
+        return @intCast(@min(100, @divTrunc(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+    }
+
+    fn presented(self: *FramePacer, now_ns: i96) void {
+        self.dirty = false;
+        // Schedule from this submission, not an old deadline: never catch up
+        // missed intervals with a burst of frames.
+        self.next_frame_ns = now_ns + self.interval_ns;
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -48,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
 
     var renderer = try Renderer.init();
     defer renderer.deinit();
-    var font = try Renderer.Font.init(config.font_path, config.font_size);
+    var font = try Renderer.Font.init(gpa, config.font_path, config.font_size);
     defer font.deinit();
     var input = try Input.init();
     defer input.deinit();
@@ -94,19 +120,29 @@ pub fn main(init: std.process.Init) !void {
     try renderer.drawTerminal(&font, &term);
     try renderer.present();
 
+    var pacing = FramePacer{
+        .interval_ns = renderer.frameIntervalNs(),
+        .next_frame_ns = 0,
+    };
+    pacing.presented(std.Io.Clock.awake.now(io).toNanoseconds());
+    var pty_closed = false;
     var output: [4096]u8 = undefined;
     var keys: [64]u8 = undefined;
     while (!stopping.load(.monotonic)) {
-        input.keyboard.application_cursor = term.modes.get(.cursor_keys);
-        while (try input.next(&keys)) |bytes| try pty.queue(bytes);
-        try pty.flush();
+        if (!pty_closed) {
+            input.keyboard.application_cursor = term.modes.get(.cursor_keys);
+            while (try input.next(&keys)) |bytes| try pty.queue(bytes);
+            try pty.flush();
+        }
 
         var fds = [_]c.struct_pollfd{
-            .{ .fd = pty.fd, .events = @intCast(c.POLLIN | (if (pty.wantsWrite()) c.POLLOUT else @as(c_int, 0))), .revents = 0 },
-            .{ .fd = input.fd, .events = c.POLLIN, .revents = 0 },
+            // A negative fd disables polling, including persistent POLLHUP.
+            .{ .fd = if (pty_closed) -1 else pty.fd, .events = @intCast(c.POLLIN | (if (pty.wantsWrite()) c.POLLOUT else @as(c_int, 0))), .revents = 0 },
+            .{ .fd = if (pty_closed) -1 else input.fd, .events = c.POLLIN, .revents = 0 },
+            .{ .fd = if (renderer.flip_pending) renderer.fd else -1, .events = c.POLLIN, .revents = 0 },
         };
-        // A timeout also detects shell exit if descendants keep the slave open.
-        if (c.poll(&fds, fds.len, 100) < 0) {
+        const timeout = pacing.timeoutMs(std.Io.Clock.awake.now(io).toNanoseconds(), renderer.flip_pending);
+        if (c.poll(&fds, fds.len, timeout) < 0) {
             if (Pty.errno() == c.EINTR) continue;
             return error.PollFailed;
         }
@@ -115,30 +151,73 @@ pub fn main(init: std.process.Init) !void {
         }
         if (fds[1].revents & (c.POLLERR | c.POLLHUP) != 0) return error.InputDisconnected;
 
-        var dirty = false;
-        var closed = false;
-        var drained = false;
-        // Bound each batch so a noisy process cannot starve keyboard input.
-        for (0..16) |_| {
-            const n = (try pty.read(&output)) orelse {
-                drained = true;
-                break;
-            };
-            if (n == 0) {
-                closed = true;
-                break;
+        if (fds[2].revents & (c.POLLERR | c.POLLHUP) != 0) return error.DisplayDisconnected;
+        if (fds[2].revents & c.POLLIN != 0) try renderer.handleEvents();
+
+        if (!pty_closed) {
+            var drained = false;
+            // Bound each batch so a noisy process cannot starve keyboard input
+            // or DRM events: at most 16 reads of 4096 bytes per iteration.
+            for (0..16) |_| {
+                const n = (try pty.read(&output)) orelse {
+                    drained = true;
+                    break;
+                };
+                if (n == 0) {
+                    pty_closed = true;
+                    break;
+                }
+                session.stream.nextSlice(output[0..n]);
+                if (session.write_error) |err| return err;
+                if (session.stream.handler.semantic_failure) return error.TerminalUpdateFailed;
+                pacing.dirty = true;
             }
-            session.stream.nextSlice(output[0..n]);
-            if (session.write_error) |err| return err;
-            if (session.stream.handler.semantic_failure) return error.TerminalUpdateFailed;
-            dirty = true;
+            if (drained and pty.exited()) pty_closed = true;
         }
-        if (dirty) {
+        if (pacing.ready(std.Io.Clock.awake.now(io).toNanoseconds(), renderer.flip_pending)) {
             try renderer.drawTerminal(&font, &term);
             try renderer.present();
+            pacing.presented(std.Io.Clock.awake.now(io).toNanoseconds());
         }
-        if (closed or (pty.exited() and drained)) break;
+        // EOF must not discard updates coalesced behind a pending flip. Wait
+        // for the final frame's completion before tearing down the renderer.
+        // An explicit termination signal still cancels this graceful drain.
+        if (pty_closed and !pacing.dirty and !renderer.flip_pending) break;
     }
+}
+
+test "frame pacing coalesces updates and preserves dirty while a flip is pending" {
+    const interval = std.time.ns_per_s / 60;
+    var pacing = FramePacer{ .interval_ns = interval, .next_frame_ns = 0 };
+    pacing.presented(0);
+    try std.testing.expectEqual(@as(c_int, 100), pacing.timeoutMs(interval, false));
+    try std.testing.expect(!pacing.ready(interval, false));
+
+    pacing.dirty = true;
+    try std.testing.expect(!pacing.ready(interval - 1, false));
+    try std.testing.expect(!pacing.ready(interval, true));
+    try std.testing.expectEqual(@as(c_int, 100), pacing.timeoutMs(interval, true));
+    try std.testing.expect(pacing.dirty);
+    try std.testing.expect(pacing.ready(interval, false));
+    try std.testing.expectEqual(@as(c_int, 0), pacing.timeoutMs(interval, false));
+
+    // A delayed submission starts a new interval instead of catching up.
+    pacing.presented(10 * interval);
+    try std.testing.expect(!pacing.dirty);
+    pacing.dirty = true;
+    try std.testing.expect(!pacing.ready(10 * interval, false));
+    try std.testing.expect(pacing.ready(11 * interval, false));
+}
+
+test "frame pacing rounds waits up and caps shell exit checks at 100ms" {
+    var pacing = FramePacer{ .interval_ns = std.time.ns_per_s, .next_frame_ns = std.time.ns_per_s, .dirty = true };
+    try std.testing.expectEqual(@as(c_int, 100), pacing.timeoutMs(0, false));
+    try std.testing.expectEqual(@as(c_int, 2), pacing.timeoutMs(std.time.ns_per_s - std.time.ns_per_ms - 1, false));
+    try std.testing.expectEqual(@as(c_int, 1), pacing.timeoutMs(std.time.ns_per_s - 1, false));
+    try std.testing.expectEqual(@as(c_int, 0), pacing.timeoutMs(std.time.ns_per_s, false));
+    try std.testing.expectEqual(@as(c_int, 0), pacing.timeoutMs(2 * std.time.ns_per_s, false));
+    pacing.dirty = false;
+    try std.testing.expectEqual(@as(c_int, 100), pacing.timeoutMs(2 * std.time.ns_per_s, false));
 }
 
 test "terminal stream parses split output and queues cursor reports" {

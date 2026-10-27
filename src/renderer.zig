@@ -7,16 +7,46 @@ const ghosttyvt = @import("ghostty-vt");
 
 const Self = @This();
 
-/// Owns a reusable FreeType face. Cell dimensions are in pixels (u32).
+const Glyph = struct {
+    alpha: []u8,
+    width: usize,
+    rows: usize,
+    left: i32,
+    top: i32,
+
+    fn copy(allocator: std.mem.Allocator, bitmap: freetype.FT_Bitmap, left: i32, top: i32) !Glyph {
+        if (bitmap.pixel_mode != freetype.FT_PIXEL_MODE_GRAY and bitmap.pixel_mode != freetype.FT_PIXEL_MODE_MONO)
+            return error.UnsupportedGlyphPixelMode;
+        const alpha = try allocator.alloc(u8, @as(usize, bitmap.width) * bitmap.rows);
+        for (0..bitmap.rows) |row| {
+            // FreeType pitch is signed and may include padding between rows.
+            const address = @as(i128, @intCast(@intFromPtr(bitmap.buffer))) + @as(i128, @intCast(row)) * bitmap.pitch;
+            const source: [*]const u8 = @ptrFromInt(@as(usize, @intCast(address)));
+            const dest = alpha[row * bitmap.width ..][0..bitmap.width];
+            if (bitmap.pixel_mode == freetype.FT_PIXEL_MODE_GRAY) {
+                @memcpy(dest, source[0..bitmap.width]);
+            } else {
+                for (dest, 0..) |*value, column| {
+                    value.* = if (source[column / 8] & (@as(u8, 0x80) >> @as(u3, @intCast(column % 8))) != 0) 255 else 0;
+                }
+            }
+        }
+        return .{ .alpha = alpha, .width = bitmap.width, .rows = bitmap.rows, .left = left, .top = top };
+    }
+};
+
+/// Owns a reusable FreeType face and cached glyph masks at one fixed size.
 /// Not thread-safe: loading a glyph mutates the face's glyph slot.
 pub const Font = struct {
+    allocator: std.mem.Allocator,
+    glyphs: std.AutoHashMapUnmanaged(u21, Glyph) = .empty,
     library: freetype.FT_Library,
     face: freetype.FT_Face,
     cell_width: u32,
     cell_height: u32,
     ascender: i32,
 
-    pub fn init(font_path: [*:0]const u8, pixel_size: u32) !Font {
+    pub fn init(allocator: std.mem.Allocator, font_path: [*:0]const u8, pixel_size: u32) !Font {
         if (pixel_size == 0) return error.InvalidPixelSize;
         var library: freetype.FT_Library = undefined;
         if (freetype.FT_Init_FreeType(&library) != 0) return error.FailedToInitializeFreeType;
@@ -34,6 +64,7 @@ pub const Font = struct {
         // Coordinates below use signed pixel offsets, including glyph bearings.
         if (width > std.math.maxInt(i32) or height > std.math.maxInt(i32)) return error.InvalidFontMetrics;
         return .{
+            .allocator = allocator,
             .library = library,
             .face = face,
             .cell_width = @intCast(width),
@@ -42,7 +73,21 @@ pub const Font = struct {
         };
     }
 
+    fn glyph(self: *Font, codepoint: u21) !*const Glyph {
+        if (self.glyphs.getPtr(codepoint)) |cached| return cached;
+        if (freetype.FT_Load_Char(self.face, codepoint, freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_NORMAL) != 0)
+            return error.GlyphLoadFailed;
+        const slot = self.face.*.glyph.*;
+        const cached = try Glyph.copy(self.allocator, slot.bitmap, slot.bitmap_left, slot.bitmap_top);
+        errdefer self.allocator.free(cached.alpha);
+        try self.glyphs.put(self.allocator, codepoint, cached);
+        return self.glyphs.getPtr(codepoint).?;
+    }
+
     pub fn deinit(self: *Font) void {
+        var values = self.glyphs.valueIterator();
+        while (values.next()) |cached| self.allocator.free(cached.alpha);
+        self.glyphs.deinit(self.allocator);
         _ = freetype.FT_Done_Face(self.face);
         _ = freetype.FT_Done_FreeType(self.library);
         self.* = undefined;
@@ -65,6 +110,7 @@ mode: libdrm.drmModeModeInfo,
 framebuffers: [2]Framebuffer,
 display_index: ?usize = null,
 render_index: usize = 0,
+flip_pending: bool = false,
 saved_crtc: ?*libdrm.drmModeCrtc,
 is_modeset: bool = false,
 
@@ -162,10 +208,9 @@ pub fn fill_rect(self: *Self, color: u32, rect: Rect) void {
         .height = self.mode.vdisplay,
     });
 
+    if (clipped_rect.width == 0 or clipped_rect.height == 0) return;
     for (clipped_rect.y..(clipped_rect.y + clipped_rect.height)) |h| {
-        for (clipped_rect.x..(clipped_rect.x + clipped_rect.width)) |w| {
-            pixels[framebuffer.stride * h + w] = color;
-        }
+        @memset(pixels[framebuffer.stride * h + clipped_rect.x ..][0..clipped_rect.width], color);
     }
 }
 
@@ -173,7 +218,7 @@ pub fn clear(self: *Self, color: u32) void {
     const framebuffer = self.framebuffers[self.render_index];
     const pixels: [*]u32 = @ptrCast(@alignCast(framebuffer.map));
     const pixel_count = framebuffer.size / @sizeOf(u32);
-    for (0..pixel_count) |i| pixels[i] = color;
+    @memset(pixels[0..pixel_count], color);
 }
 
 fn blendPixel(bg: u32, fg: u32, alpha: u8) u32 {
@@ -228,31 +273,21 @@ fn cellColors(cell: ghosttyvt.Cell, style: ghosttyvt.Style, term: *const ghostty
 /// Render one codepoint at a fixed grid origin, clipping overhang to its cells.
 fn drawGlyph(self: *Self, font: *Font, codepoint: u21, rect: Rect, color: u32) !void {
     if (codepoint == 0 or codepoint == ' ') return;
-    if (freetype.FT_Load_Char(font.face, codepoint, freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_NORMAL) != 0) {
-        return error.GlyphLoadFailed;
-    }
-    const glyph = font.face.*.glyph;
-    const bitmap = &glyph.*.bitmap;
+    const glyph = try font.glyph(codepoint);
     const clipped = rect.clip(.{ .x = 0, .y = 0, .width = self.mode.hdisplay, .height = self.mode.vdisplay });
     const framebuffer = self.framebuffers[self.render_index];
     const pixels: [*]u32 = @ptrCast(@alignCast(framebuffer.map));
 
-    for (0..bitmap.*.rows) |row| {
-        const y = @as(i64, rect.y) + font.ascender - glyph.*.bitmap_top + @as(i64, @intCast(row));
+    for (0..glyph.rows) |row| {
+        const y = @as(i64, rect.y) + font.ascender - glyph.top + @as(i64, @intCast(row));
         if (y < clipped.y or y >= @as(i64, clipped.y) + clipped.height) continue;
-        // Pitch is the signed offset to the next logical row.
-        const row_address = @as(i128, @intCast(@intFromPtr(bitmap.*.buffer))) + @as(i128, @intCast(row)) * bitmap.*.pitch;
-        const source: [*]const u8 = @ptrFromInt(@as(usize, @intCast(row_address)));
-        for (0..bitmap.*.width) |column| {
-            const x = @as(i64, rect.x) + glyph.*.bitmap_left + @as(i64, @intCast(column));
+        for (0..glyph.width) |column| {
+            const x = @as(i64, rect.x) + glyph.left + @as(i64, @intCast(column));
             if (x < clipped.x or x >= @as(i64, clipped.x) + clipped.width) continue;
-            const alpha: u8 = switch (bitmap.*.pixel_mode) {
-                freetype.FT_PIXEL_MODE_GRAY => source[column],
-                freetype.FT_PIXEL_MODE_MONO => if (source[column / 8] & (@as(u8, 0x80) >> @as(u3, @intCast(column % 8))) != 0) 255 else 0,
-                else => return error.UnsupportedGlyphPixelMode,
-            };
+            const alpha = glyph.alpha[row * glyph.width + column];
+            if (alpha == 0) continue;
             const index = @as(usize, @intCast(y)) * framebuffer.stride + @as(usize, @intCast(x));
-            pixels[index] = blendPixel(pixels[index], color, alpha);
+            pixels[index] = if (alpha == 255) color else blendPixel(pixels[index], color, alpha);
         }
     }
 }
@@ -261,6 +296,7 @@ fn drawGlyph(self: *Self, font: *Font, codepoint: u21, rect: Rect, color: u32) !
 /// The terminal already decoded UTF-8; only the first codepoint of each
 /// grapheme is rendered. Shaping, fallback fonts, and cursor blinking are not implemented.
 pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !void {
+    if (self.flip_pending) return error.PageFlipPending;
     const screen = term.screens.active;
     const default_bg = if (term.modes.get(.reverse_colors))
         (if (term.colors.foreground.get()) |rgb| rgbPixel(rgb) else 0xFFFFFF)
@@ -278,12 +314,14 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !void {
             const x = @as(u64, column) * font.cell_width;
             if (x >= self.mode.hdisplay) break;
             const colors = cellColors(cell.*, pin.style(cell), term);
-            self.fill_rect(colors.bg, .{ .x = @intCast(x), .y = y, .width = font.cell_width, .height = font.cell_height });
+            if (colors.bg != default_bg)
+                self.fill_rect(colors.bg, .{ .x = @intCast(x), .y = y, .width = font.cell_width, .height = font.cell_height });
         }
         for (cells, 0..) |*cell, column| {
             const x = @as(u64, column) * font.cell_width;
             if (x >= self.mode.hdisplay) break;
             if (cell.wide == .spacer_head or cell.wide == .spacer_tail) continue;
+            if (cell.codepoint() == 0 or cell.codepoint() == ' ') continue;
             const style = pin.style(cell);
             if (style.flags.invisible) continue;
             const colors = cellColors(cell.*, style, term);
@@ -405,7 +443,9 @@ pub fn drawText(
     }
 }
 
+/// Queue a flip without waiting; the event loop must poll fd and call handleEvents.
 pub fn present(self: *Self) !void {
+    if (self.flip_pending) return error.PageFlipPending;
     const framebuffer = self.framebuffers[self.render_index];
 
     if (self.display_index == null) {
@@ -422,30 +462,42 @@ pub fn present(self: *Self) !void {
             return error.FailedToSetCrtc;
         }
         self.is_modeset = true;
+        self.completeFlip();
     } else {
         if (libdrm.drmModePageFlip(
             self.fd,
             self.encoder.*.crtc_id,
             framebuffer.id,
             libdrm.DRM_MODE_PAGE_FLIP_EVENT,
-            null,
+            self,
         ) != 0) {
             return error.FailedToQueuePageFlip;
         }
-        if (wait_for_page_flip(self.fd) != 0) {
-            return error.FailedToWaitForPageFlip;
-        }
+        // Neither buffer is writable until the old front buffer is released.
+        self.flip_pending = true;
     }
-
-    self.display_index = self.render_index;
-    self.render_index = (self.render_index + 1) % self.framebuffers.len;
 }
 
-fn wait_for_page_flip(fd: c_int) i32 {
+fn completeFlip(self: *Self) void {
+    self.display_index = self.render_index;
+    self.render_index = (self.render_index + 1) % self.framebuffers.len;
+    self.flip_pending = false;
+}
+
+/// Call only after poll reports the DRM fd readable, so drmHandleEvent cannot
+/// block the PTY/input loop waiting for vblank.
+pub fn handleEvents(self: *Self) !void {
     var event_context = std.mem.zeroes(libdrm.drmEventContext);
     event_context.version = libdrm.DRM_EVENT_CONTEXT_VERSION;
     event_context.page_flip_handler = &page_flip_handler;
-    return @intCast(libdrm.drmHandleEvent(fd, &event_context));
+    const result = libdrm.drmHandleEvent(self.fd, &event_context);
+    if (result != 0 and std.posix.errno(result) != .INTR) return error.FailedToHandleDrmEvent;
+}
+
+pub fn frameIntervalNs(self: *const Self) u64 {
+    var refresh: u64 = self.mode.vrefresh;
+    if (refresh == 0) refresh = 60;
+    return @max(1, std.time.ns_per_s / refresh);
 }
 
 fn page_flip_handler(
@@ -459,7 +511,8 @@ fn page_flip_handler(
     _ = frame;
     _ = sec;
     _ = usec;
-    _ = user_data;
+    const self: *Self = @ptrCast(@alignCast(user_data orelse return));
+    self.completeFlip();
 }
 
 pub fn deinit(self: *Self) void {
@@ -485,6 +538,126 @@ fn restoreCrtc(self: *Self) void {
         1,
         &saved_crtc.*.mode,
     );
+}
+
+fn testRenderer(pixels: []u32, width: u16, height: u16, stride: usize) Self {
+    const framebuffer = Framebuffer{ .id = 0, .handle = 0, .map = pixels.ptr, .size = pixels.len * @sizeOf(u32), .stride = stride };
+    var mode = std.mem.zeroes(libdrm.drmModeModeInfo);
+    mode.hdisplay = width;
+    mode.vdisplay = height;
+    return .{
+        .fd = -1,
+        .resources = undefined,
+        .connector = undefined,
+        .encoder = undefined,
+        .mode = mode,
+        .framebuffers = .{ framebuffer, framebuffer },
+        .saved_crtc = null,
+    };
+}
+
+test "glyph masks own their pixels and normalize padded and negative pitch" {
+    var source = [_]u8{ 10, 20, 99, 30, 40, 99 };
+    var bitmap = std.mem.zeroes(freetype.FT_Bitmap);
+    bitmap.width = 2;
+    bitmap.rows = 2;
+    bitmap.pitch = 3;
+    bitmap.pixel_mode = freetype.FT_PIXEL_MODE_GRAY;
+    bitmap.buffer = &source;
+    const glyph = try Glyph.copy(std.testing.allocator, bitmap, -1, 2);
+    defer std.testing.allocator.free(glyph.alpha);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 20, 30, 40 }, glyph.alpha);
+    source[0] = 50;
+    try std.testing.expectEqual(@as(u8, 10), glyph.alpha[0]);
+    try std.testing.expectEqual(@as(i32, -1), glyph.left);
+    try std.testing.expectEqual(@as(i32, 2), glyph.top);
+
+    bitmap.buffer = source[3..].ptr;
+    bitmap.pitch = -3;
+    const reversed = try Glyph.copy(std.testing.allocator, bitmap, 0, 0);
+    defer std.testing.allocator.free(reversed.alpha);
+    try std.testing.expectEqualSlices(u8, &.{ 30, 40, 50, 20 }, reversed.alpha);
+}
+
+test "glyph masks unpack monochrome pixels across byte boundaries" {
+    var source = [_]u8{ 0b10100001, 0b10000000 };
+    var bitmap = std.mem.zeroes(freetype.FT_Bitmap);
+    bitmap.width = 9;
+    bitmap.rows = 1;
+    bitmap.pitch = 2;
+    bitmap.pixel_mode = freetype.FT_PIXEL_MODE_MONO;
+    bitmap.buffer = &source;
+    const glyph = try Glyph.copy(std.testing.allocator, bitmap, 0, 0);
+    defer std.testing.allocator.free(glyph.alpha);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 255, 0, 0, 0, 0, 255, 255 }, glyph.alpha);
+    bitmap.pixel_mode = freetype.FT_PIXEL_MODE_BGRA;
+    try std.testing.expectError(error.UnsupportedGlyphPixelMode, Glyph.copy(std.testing.allocator, bitmap, 0, 0));
+}
+
+test "framebuffer fills clip rectangles and respect padded stride" {
+    var pixels = [_]u32{99} ** 12;
+    var renderer = testRenderer(&pixels, 3, 3, 4);
+    renderer.clear(0x123456);
+    try std.testing.expectEqualSlices(u32, &([_]u32{0x123456} ** 12), &pixels);
+    renderer.fill_rect(7, .{ .x = 1, .y = 1, .width = 20, .height = 20 });
+    try std.testing.expectEqualSlices(u32, &.{ 0x123456, 0x123456, 0x123456, 0x123456, 0x123456, 7, 7, 0x123456, 0x123456, 7, 7, 0x123456 }, &pixels);
+    renderer.fill_rect(8, .{ .x = 10, .y = 10, .width = 2, .height = 2 });
+    try std.testing.expectEqual(@as(u32, 7), pixels[10]);
+}
+
+test "cached glyphs render with backgrounds, reverse colors and transparent pixels" {
+    const allocator = std.testing.allocator;
+    var font = Font{
+        .allocator = allocator,
+        // Cache hits must not access the FreeType face or its mutable slot.
+        .library = null,
+        .face = null,
+        .cell_width = 2,
+        .cell_height = 1,
+        .ascender = 0,
+    };
+    defer font.glyphs.deinit(allocator);
+    const alpha = try allocator.dupe(u8, &.{ 255, 0 });
+    defer allocator.free(alpha);
+    try font.glyphs.put(allocator, 'A', .{ .alpha = alpha, .width = 2, .rows = 1, .left = 0, .top = 0 });
+    const first = try font.glyph('A');
+    try std.testing.expect(first == try font.glyph('A'));
+
+    var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 1 });
+    defer term.deinit(allocator);
+    var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?25lA\x1b[41m \x1b[0m");
+    var pixels = [_]u32{99} ** 8;
+    var renderer = testRenderer(&pixels, 6, 1, 8);
+    try renderer.drawTerminal(&font, &term);
+    const red = rgbPixel(term.colors.palette.current[1]);
+    try std.testing.expectEqualSlices(u32, &.{ 0xFFFFFF, 0, red, red, 0, 0, 0, 0 }, &pixels);
+
+    stream.nextSlice("\x1b[?5h");
+    try renderer.drawTerminal(&font, &term);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF }, &pixels);
+}
+
+test "page flip completion releases the old buffer and pending flips prevent drawing" {
+    var pixels = [_]u32{0};
+    var renderer = testRenderer(&pixels, 1, 1, 1);
+    renderer.display_index = 0;
+    renderer.render_index = 1;
+    renderer.flip_pending = true;
+    try std.testing.expectError(error.PageFlipPending, renderer.present());
+    // The pending guard must run before touching font or terminal state.
+    var font: Font = undefined;
+    var term: ghosttyvt.Terminal = undefined;
+    try std.testing.expectError(error.PageFlipPending, renderer.drawTerminal(&font, &term));
+    try std.testing.expectEqual(@as(usize, 1), renderer.render_index);
+    page_flip_handler(-1, 0, 0, 0, &renderer);
+    try std.testing.expect(!renderer.flip_pending);
+    try std.testing.expectEqual(@as(?usize, 1), renderer.display_index);
+    try std.testing.expectEqual(@as(usize, 0), renderer.render_index);
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s / 60), renderer.frameIntervalNs());
+    renderer.mode.vrefresh = 144;
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s / 144), renderer.frameIntervalNs());
 }
 
 fn createFramebuffer(fd: c_int, mode: libdrm.drmModeModeInfo) !Framebuffer {
