@@ -1,4 +1,5 @@
-const std = @import("std");
-
-font_path: [:0]const u8 = "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
+// Null uses bundled JetBrains Mono. External families must provide
+// <font_name>-{Regular,Bold,Italic,BoldItalic}.ttf in this directory.
+font_directory: ?[]const u8 = null,
+font_name: []const u8 = "JetBrainsMono",
 font_size: u8 = 16,

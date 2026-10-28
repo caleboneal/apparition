@@ -54,6 +54,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("freetype", freetype.createModule());
 
     b.installArtifact(exe);
+    b.installFile("src/fonts/OFL.txt", "share/licenses/apparition/JetBrainsMono-OFL.txt");
 
     const tests = b.addTest(.{ .root_module = exe.root_module });
     const run_tests = b.addRunArtifact(tests);

@@ -75,7 +75,11 @@ pub fn main(init: std.process.Init) !void {
 
     var renderer = try Renderer.init(gpa);
     defer renderer.deinit();
-    var font = try Renderer.Font.init(gpa, config.font_path, config.font_size);
+    var font = try Renderer.Font.init(gpa, .{
+        .directory = config.font_directory,
+        .name = config.font_name,
+        .pixel_size = config.font_size,
+    });
     defer font.deinit();
     var input = try Input.init();
     defer input.deinit();
