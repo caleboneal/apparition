@@ -14,9 +14,13 @@ zig build
 zig build run
 ```
 
-Run on Linux with access to `/dev/dri/card0` and the input devices on `seat0`,
-and with DRM master available (normally from an active virtual console without
-another display server owning the device). The configured font must exist;
+Run on Linux with access to a primary DRM node in `/dev/dri` and the input
+devices on `seat0`, with DRM master available (normally from an active virtual
+console without another display server owning the device). Apparition discovers
+DRM cards and selects one with dumb-buffer support and a connected, routable
+output, skipping inaccessible or unsuitable cards. It prefers an existing
+compatible display route and the output's preferred mode, and logs the selected
+card, connector, and CRTC. The configured font must exist;
 see `src/config.zig` for the font path and size. Running via `sudo` also runs
 the shell as root, so prefer appropriate device permissions when possible.
 
@@ -38,7 +42,10 @@ whole visible grid; dirty-row rendering is not yet implemented.
 This is still rudimentary: no key autorepeat, scrollback UI, mouse input,
 clipboard, IME/compose, font fallback, grapheme shaping, or display hotplug/
 resize handling. Rendering uses the first codepoint of each grapheme, and
-bold/italic/underline styling is not yet drawn.
+bold/italic/underline font styling is not yet drawn. Colors use the xterm ANSI
+palette and standard 256-color cube/grayscale ramp, with bold-as-bright ANSI
+foregrounds, faint text, inverse video, and truecolor support. Application OSC
+color changes and resets are honored.
 
 ## Tests
 

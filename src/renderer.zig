@@ -4,6 +4,8 @@ const linux = std.os.linux;
 const libdrm = @import("libdrm");
 const freetype = @import("freetype");
 const ghosttyvt = @import("ghostty-vt");
+const Drm = @import("drm.zig");
+const Colors = @import("colors.zig");
 
 const Self = @This();
 
@@ -102,10 +104,8 @@ const Framebuffer = struct {
     stride: usize,
 };
 
+device: Drm.Device,
 fd: c_int,
-resources: *libdrm.drmModeRes,
-connector: *libdrm.drmModeConnector,
-encoder: *libdrm.drmModeEncoder,
 mode: libdrm.drmModeModeInfo,
 framebuffers: [2]Framebuffer,
 display_index: ?usize = null,
@@ -115,36 +115,12 @@ saved_crtc: ?*libdrm.drmModeCrtc,
 is_modeset: bool = false,
 
 pub fn init() !Self {
-    const fd: c_int = @intCast(linux.open(
-        "/dev/dri/card0",
-        .{ .ACCMODE = .RDWR, .CLOEXEC = true },
-        0,
-    ));
-    if (fd < 0) return error.FailedToOpenDevice;
-    errdefer _ = linux.close(fd);
-
-    const resources = libdrm.drmModeGetResources(fd) orelse return error.FailedToGetResources;
-    errdefer libdrm.drmModeFreeResources(resources);
-
-    var connector: ?*libdrm.drmModeConnector = null;
-    for (0..@intCast(resources.*.count_connectors)) |i| {
-        const candidate = libdrm.drmModeGetConnector(fd, resources.*.connectors[i]) orelse continue;
-        if (candidate.*.connection == libdrm.DRM_MODE_CONNECTED and candidate.*.count_modes > 0) {
-            connector = candidate;
-            break;
-        }
-        libdrm.drmModeFreeConnector(candidate);
-    }
-    const selected_connector = connector orelse return error.NoConnectedDisplay;
-    errdefer libdrm.drmModeFreeConnector(selected_connector);
-
-    const encoder = libdrm.drmModeGetEncoder(
-        fd,
-        selected_connector.*.encoder_id,
-    ) orelse return error.NoEncoder;
-    errdefer libdrm.drmModeFreeEncoder(encoder);
-
-    const mode = selected_connector.*.modes.*;
+    var device = try Drm.Device.init();
+    errdefer device.deinit();
+    const fd = device.fd;
+    const mode = device.mode;
+    const saved_crtc = libdrm.drmModeGetCrtc(fd, device.crtc_id) orelse return error.FailedToSaveCrtc;
+    errdefer libdrm.drmModeFreeCrtc(saved_crtc);
     var framebuffers: [2]Framebuffer = undefined;
     var framebuffer_count: usize = 0;
     errdefer for (framebuffers[0..framebuffer_count]) |framebuffer| {
@@ -157,13 +133,11 @@ pub fn init() !Self {
     }
 
     return .{
+        .device = device,
         .fd = fd,
-        .resources = resources,
-        .connector = selected_connector,
-        .encoder = encoder,
         .mode = mode,
         .framebuffers = framebuffers,
-        .saved_crtc = libdrm.drmModeGetCrtc(fd, encoder.*.crtc_id),
+        .saved_crtc = saved_crtc,
     };
 }
 
@@ -242,31 +216,26 @@ fn rgbPixel(rgb: ghosttyvt.color.RGB) u32 {
     return (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | rgb.b;
 }
 
-fn resolveColor(color: ghosttyvt.Style.Color, fallback: u32, term: *const ghosttyvt.Terminal) u32 {
-    return switch (color) {
-        .none => fallback,
-        .palette => |index| rgbPixel(term.colors.palette.current[index]),
-        .rgb => |rgb| rgbPixel(rgb),
-    };
-}
-
 const CellColors = struct { fg: u32, bg: u32 };
 
+fn defaultColors(term: *const ghosttyvt.Terminal) struct { fg: ghosttyvt.color.RGB, bg: ghosttyvt.color.RGB } {
+    var fg = term.colors.foreground.get() orelse Colors.foreground;
+    var bg = term.colors.background.get() orelse Colors.background;
+    // DECSCNM reverses defaults, not explicitly selected ANSI/RGB colors.
+    if (term.modes.get(.reverse_colors)) std.mem.swap(ghosttyvt.color.RGB, &fg, &bg);
+    return .{ .fg = fg, .bg = bg };
+}
+
 fn cellColors(cell: ghosttyvt.Cell, style: ghosttyvt.Style, term: *const ghosttyvt.Terminal) CellColors {
+    const defaults = defaultColors(term);
+    const palette = &term.colors.palette.current;
     var colors: CellColors = .{
-        .fg = resolveColor(style.fg_color, if (term.colors.foreground.get()) |rgb| rgbPixel(rgb) else 0xFFFFFF, term),
-        .bg = resolveColor(style.bg_color, if (term.colors.background.get()) |rgb| rgbPixel(rgb) else 0x000000, term),
+        .fg = rgbPixel(style.fg(.{ .default = defaults.fg, .palette = palette, .bold = .bright })),
+        // bg() also handles blank cells that store their background inline.
+        .bg = rgbPixel(style.bg(&cell, palette) orelse defaults.bg),
     };
-    // Blank backgrounds may be stored directly in the cell, without a style.
-    switch (cell.content_tag) {
-        .bg_color_palette => colors.bg = rgbPixel(term.colors.palette.current[cell.content.color_palette.data]),
-        .bg_color_rgb => {
-            const rgb = cell.content.color_rgb;
-            colors.bg = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | rgb.b;
-        },
-        else => {},
-    }
-    if (style.flags.inverse != term.modes.get(.reverse_colors)) std.mem.swap(u32, &colors.fg, &colors.bg);
+    if (style.flags.inverse) std.mem.swap(u32, &colors.fg, &colors.bg);
+    if (style.flags.faint) colors.fg = blendPixel(colors.bg, colors.fg, 128);
     return colors;
 }
 
@@ -298,10 +267,7 @@ fn drawGlyph(self: *Self, font: *Font, codepoint: u21, rect: Rect, color: u32) !
 pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !void {
     if (self.flip_pending) return error.PageFlipPending;
     const screen = term.screens.active;
-    const default_bg = if (term.modes.get(.reverse_colors))
-        (if (term.colors.foreground.get()) |rgb| rgbPixel(rgb) else 0xFFFFFF)
-    else
-        (if (term.colors.background.get()) |rgb| rgbPixel(rgb) else 0x000000);
+    const default_bg = rgbPixel(defaultColors(term).bg);
     self.clear(default_bg);
 
     var rows = screen.pages.rowIterator(.right_down, .{ .active = .{} }, null);
@@ -451,11 +417,11 @@ pub fn present(self: *Self) !void {
     if (self.display_index == null) {
         if (libdrm.drmModeSetCrtc(
             self.fd,
-            self.encoder.*.crtc_id,
+            self.device.crtc_id,
             framebuffer.id,
             0,
             0,
-            &self.connector.*.connector_id,
+            &self.device.connector.connector_id,
             1,
             &self.mode,
         ) != 0) {
@@ -466,7 +432,7 @@ pub fn present(self: *Self) !void {
     } else {
         if (libdrm.drmModePageFlip(
             self.fd,
-            self.encoder.*.crtc_id,
+            self.device.crtc_id,
             framebuffer.id,
             libdrm.DRM_MODE_PAGE_FLIP_EVENT,
             self,
@@ -516,28 +482,52 @@ fn page_flip_handler(
 }
 
 pub fn deinit(self: *Self) void {
+    // Normal shell exit already drains flips. Signals and error exits may not.
+    if (self.flip_pending) self.finishPendingFlip();
     if (self.is_modeset) self.restoreCrtc();
     if (self.saved_crtc) |saved_crtc| libdrm.drmModeFreeCrtc(saved_crtc);
 
     for (self.framebuffers) |framebuffer| destroyFramebuffer(self.fd, framebuffer);
-    libdrm.drmModeFreeEncoder(self.encoder);
-    libdrm.drmModeFreeConnector(self.connector);
-    libdrm.drmModeFreeResources(self.resources);
-    _ = linux.close(self.fd);
+    self.device.deinit();
+}
+
+fn finishPendingFlip(self: *Self) void {
+    var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = std.posix.poll(&fds, 1000) catch |err| {
+        std.log.warn("Cannot wait for final DRM flip: {s}", .{@errorName(err)});
+        return;
+    };
+    if (ready == 0 or fds[0].revents & std.posix.POLL.IN == 0) {
+        std.log.warn("Final DRM flip did not complete before display restoration", .{});
+        return;
+    }
+    self.handleEvents() catch |err| std.log.warn("Cannot complete final DRM flip: {s}", .{@errorName(err)});
 }
 
 fn restoreCrtc(self: *Self) void {
     const saved_crtc = self.saved_crtc orelse return;
-    _ = libdrm.drmModeSetCrtc(
-        self.fd,
-        saved_crtc.*.crtc_id,
-        saved_crtc.*.buffer_id,
-        saved_crtc.*.x,
-        saved_crtc.*.y,
-        &self.connector.*.connector_id,
-        1,
-        &saved_crtc.*.mode,
-    );
+    for (0..2) |_| {
+        const result = libdrm.drmModeSetCrtc(
+            self.fd,
+            saved_crtc.*.crtc_id,
+            saved_crtc.*.buffer_id,
+            saved_crtc.*.x,
+            saved_crtc.*.y,
+            if (saved_crtc.*.mode_valid != 0) &self.device.connector.connector_id else null,
+            if (saved_crtc.*.mode_valid != 0) 1 else 0,
+            if (saved_crtc.*.mode_valid != 0) &saved_crtc.*.mode else null,
+        );
+        const err = std.posix.errno(result);
+        if (err == .SUCCESS) return;
+        if (err == .INTR) continue;
+        if (err == .BUSY and self.flip_pending) {
+            self.finishPendingFlip();
+            continue;
+        }
+        std.log.warn("Failed to restore CRTC {d}: {s}", .{ saved_crtc.*.crtc_id, @tagName(err) });
+        return;
+    }
+    std.log.warn("Could not restore CRTC {d} after retrying", .{saved_crtc.*.crtc_id});
 }
 
 fn testRenderer(pixels: []u32, width: u16, height: u16, stride: usize) Self {
@@ -547,9 +537,7 @@ fn testRenderer(pixels: []u32, width: u16, height: u16, stride: usize) Self {
     mode.vdisplay = height;
     return .{
         .fd = -1,
-        .resources = undefined,
-        .connector = undefined,
-        .encoder = undefined,
+        .device = undefined,
         .mode = mode,
         .framebuffers = .{ framebuffer, framebuffer },
         .saved_crtc = null,
@@ -625,6 +613,7 @@ test "cached glyphs render with backgrounds, reverse colors and transparent pixe
 
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 1 });
     defer term.deinit(allocator);
+    try Colors.configure(&term, allocator);
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     stream.nextSlice("\x1b[?25lA\x1b[41m \x1b[0m");
@@ -632,11 +621,53 @@ test "cached glyphs render with backgrounds, reverse colors and transparent pixe
     var renderer = testRenderer(&pixels, 6, 1, 8);
     try renderer.drawTerminal(&font, &term);
     const red = rgbPixel(term.colors.palette.current[1]);
-    try std.testing.expectEqualSlices(u32, &.{ 0xFFFFFF, 0, red, red, 0, 0, 0, 0 }, &pixels);
+    const fg = rgbPixel(Colors.foreground);
+    try std.testing.expectEqualSlices(u32, &.{ fg, 0, red, red, 0, 0, 0, 0 }, &pixels);
 
     stream.nextSlice("\x1b[?5h");
     try renderer.drawTerminal(&font, &term);
-    try std.testing.expectEqualSlices(u32, &.{ 0, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF }, &pixels);
+    try std.testing.expectEqualSlices(u32, &.{ 0, fg, red, red, fg, fg, fg, fg }, &pixels);
+}
+
+test "SGR colors preserve indexed and RGB values and apply intensity and inverse" {
+    const allocator = std.testing.allocator;
+    var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 16, .rows = 1 });
+    defer term.deinit(allocator);
+    try Colors.configure(&term, allocator);
+    var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
+    defer stream.deinit();
+    stream.nextSlice("\x1b[31mA\x1b[1mB\x1b[22;91mC\x1b[0;38;5;196mD" ++
+        "\x1b[38;2;18;52;86;48;2;101;67;33mE\x1b[7mF\x1b[0;2;31mG\x1b[0;44m H");
+    const fg = rgbPixel(Colors.foreground);
+    const expected = [_]CellColors{
+        .{ .fg = 0xCD0000, .bg = 0 },
+        .{ .fg = 0xFF0000, .bg = 0 },
+        .{ .fg = 0xFF0000, .bg = 0 },
+        .{ .fg = 0xFF0000, .bg = 0 },
+        .{ .fg = 0x123456, .bg = 0x654321 },
+        .{ .fg = 0x654321, .bg = 0x123456 },
+        .{ .fg = 0x660000, .bg = 0 },
+        .{ .fg = fg, .bg = 0x0000EE },
+        .{ .fg = fg, .bg = 0x0000EE },
+    };
+    for (expected, 0..) |colors, x| {
+        const pin = term.screens.active.pages.pin(.{ .active = .{ .x = @intCast(x), .y = 0 } }).?;
+        const cell = pin.rowAndCell().cell;
+        try std.testing.expectEqual(colors, cellColors(cell.*, pin.style(cell), &term));
+    }
+    // Reverse-video must not swap explicit foreground/background pairs.
+    stream.nextSlice("\x1b[?5h");
+    for ([_]u16{ 4, 5 }) |x| {
+        const pin = term.screens.active.pages.pin(.{ .active = .{ .x = x, .y = 0 } }).?;
+        const cell = pin.rowAndCell().cell;
+        try std.testing.expectEqual(expected[x], cellColors(cell.*, pin.style(cell), &term));
+    }
+    const pin = term.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?;
+    const cell = pin.rowAndCell().cell;
+    try std.testing.expectEqual(CellColors{ .fg = 0xCD0000, .bg = fg }, cellColors(cell.*, pin.style(cell), &term));
+    // Cached cells must continue to follow application palette updates.
+    stream.nextSlice("\x1b]4;1;#123456\x07");
+    try std.testing.expectEqual(CellColors{ .fg = 0x123456, .bg = fg }, cellColors(cell.*, pin.style(cell), &term));
 }
 
 test "page flip completion releases the old buffer and pending flips prevent drawing" {
@@ -704,7 +735,7 @@ fn createFramebuffer(fd: c_int, mode: libdrm.drmModeModeInfo) !Framebuffer {
         fd,
         offset,
     );
-    if (map == std.math.maxInt(usize)) return error.MmapFailed;
+    if (linux.errno(map) != .SUCCESS) return error.MmapFailed;
     const mapped_memory: *anyopaque = @ptrFromInt(map);
     errdefer _ = linux.munmap(@ptrCast(mapped_memory), @intCast(create_request.size));
 

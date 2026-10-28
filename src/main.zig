@@ -2,6 +2,7 @@ const std = @import("std");
 const Renderer = @import("renderer.zig");
 const Input = @import("input.zig");
 const Config = @import("config.zig");
+const Colors = @import("colors.zig");
 const Pty = @import("pty.zig");
 const c = Pty.c;
 const ghosttyvt = @import("ghostty-vt");
@@ -84,6 +85,7 @@ pub fn main(init: std.process.Init) !void {
     if (cols == 0 or rows == 0) return error.DisplayTooSmall;
     var term = try ghosttyvt.Terminal.init(io, gpa, .{ .cols = cols, .rows = rows });
     defer term.deinit(gpa);
+    try Colors.configure(&term, gpa);
     term.width_px = renderer.mode.hdisplay;
     term.height_px = renderer.mode.vdisplay;
 
