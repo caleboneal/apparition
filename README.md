@@ -35,9 +35,11 @@ the shell. The event loop polls PTY, input, and pending DRM page-flip events
 instead of busy-spinning or blocking on vblank. Output updates are coalesced
 at the display refresh rate (60 Hz if the mode does not report one).
 
-Rendering caches glyph masks for the configured font size, uses bulk pixel
-fills, and skips redundant default-background fills. Frames still redraw the
-whole visible grid; dirty-row rendering is not yet implemented.
+Rendering caches glyph masks for the configured font size and repaints only
+damaged rows. Damage accumulates independently for both framebuffers, including
+the old and new cursor rows. Screen, palette, default-color, and grid changes
+trigger full redraws (including display margins). Once the back buffer is
+current, nonvisual output does not cause another page flip.
 
 This is still rudimentary: no key autorepeat, scrollback UI, mouse input,
 clipboard, IME/compose, font fallback, grapheme shaping, or display hotplug/
@@ -54,5 +56,7 @@ zig build test
 ```
 
 Tests cover PTY shell startup and sizing, exec failure, queued input,
-terminal parsing/replies, keyboard translation, and renderer helpers without
-requiring DRM or input hardware.
+terminal parsing/replies, keyboard translation, DRM routing helpers, and
+incremental rendering without requiring DRM or input hardware. Renderer tests
+compare dirty-row frames against full redraws through buffer flips, cursor
+changes, scrolling, screen switches, color changes, and drawing-error retries.

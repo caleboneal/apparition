@@ -73,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
         .flags = 0,
     }, null);
 
-    var renderer = try Renderer.init();
+    var renderer = try Renderer.init(gpa);
     defer renderer.deinit();
     var font = try Renderer.Font.init(gpa, config.font_path, config.font_size);
     defer font.deinit();
@@ -119,7 +119,7 @@ pub fn main(init: std.process.Init) !void {
         _ = console.ioctl(0, console.KDSETMODE, display_mode);
     };
 
-    try renderer.drawTerminal(&font, &term);
+    _ = try renderer.drawTerminal(&font, &term);
     try renderer.present();
 
     var pacing = FramePacer{
@@ -177,8 +177,7 @@ pub fn main(init: std.process.Init) !void {
             if (drained and pty.exited()) pty_closed = true;
         }
         if (pacing.ready(std.Io.Clock.awake.now(io).toNanoseconds(), renderer.flip_pending)) {
-            try renderer.drawTerminal(&font, &term);
-            try renderer.present();
+            if (try renderer.drawTerminal(&font, &term)) try renderer.present();
             pacing.presented(std.Io.Clock.awake.now(io).toNanoseconds());
         }
         // EOF must not discard updates coalesced behind a pending flip. Wait

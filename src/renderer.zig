@@ -104,6 +104,56 @@ const Framebuffer = struct {
     stride: usize,
 };
 
+const RowDamage = struct {
+    node: usize = 0,
+    serial: u64 = 0,
+    page_y: u16 = 0,
+    pending: [2]bool = .{ true, true },
+};
+
+const RenderKey = struct {
+    screen: usize,
+    cols: u16,
+    width: u16,
+    height: u16,
+    font: *Font,
+    cell_width: u32,
+    cell_height: u32,
+    ascender: i32,
+    fg: u32,
+    bg: u32,
+};
+
+const CursorState = struct {
+    x: u16,
+    y: u16,
+    visible: bool,
+    style: u8,
+    color: ?ghosttyvt.color.RGB,
+};
+
+const Damage = struct {
+    rows: std.ArrayList(RowDamage) = .empty,
+    full: [2]bool = .{ true, true },
+    key: ?RenderKey = null,
+    cursor: ?CursorState = null,
+
+    fn deinit(self: *Damage, allocator: std.mem.Allocator) void {
+        self.rows.deinit(allocator);
+    }
+
+    fn invalidate(self: *Damage) void {
+        self.full = .{ true, true };
+        for (self.rows.items) |*row| row.pending = .{ true, true };
+    }
+
+    fn mark(self: *Damage, y: usize) void {
+        if (y < self.rows.items.len) self.rows.items[y].pending = .{ true, true };
+    }
+};
+
+allocator: std.mem.Allocator,
+damage: Damage = .{},
 device: Drm.Device,
 fd: c_int,
 mode: libdrm.drmModeModeInfo,
@@ -114,7 +164,7 @@ flip_pending: bool = false,
 saved_crtc: ?*libdrm.drmModeCrtc,
 is_modeset: bool = false,
 
-pub fn init() !Self {
+pub fn init(allocator: std.mem.Allocator) !Self {
     var device = try Drm.Device.init();
     errdefer device.deinit();
     const fd = device.fd;
@@ -133,6 +183,7 @@ pub fn init() !Self {
     }
 
     return .{
+        .allocator = allocator,
         .device = device,
         .fd = fd,
         .mode = mode,
@@ -261,19 +312,81 @@ fn drawGlyph(self: *Self, font: *Font, codepoint: u21, rect: Rect, color: u32) !
     }
 }
 
-/// Full redraw of the active screen (not scrollback), without presenting it.
+/// Redraw damaged active-screen rows, without presenting. Returns false when
+/// the back buffer already matches the terminal and no page flip is needed.
 /// The terminal already decoded UTF-8; only the first codepoint of each
 /// grapheme is rendered. Shaping, fallback fonts, and cursor blinking are not implemented.
-pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !void {
+pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
     if (self.flip_pending) return error.PageFlipPending;
     const screen = term.screens.active;
-    const default_bg = rgbPixel(defaultColors(term).bg);
-    self.clear(default_bg);
+    const defaults = defaultColors(term);
+    const default_bg = rgbPixel(defaults.bg);
+    const key: RenderKey = .{
+        .screen = @intFromPtr(screen),
+        .cols = screen.pages.cols,
+        .width = self.mode.hdisplay,
+        .height = self.mode.vdisplay,
+        .font = font,
+        .cell_width = font.cell_width,
+        .cell_height = font.cell_height,
+        .ascender = font.ascender,
+        .fg = rgbPixel(defaults.fg),
+        .bg = default_bg,
+    };
+    const cursor: CursorState = .{
+        .x = screen.cursor.x,
+        .y = screen.cursor.y,
+        .visible = term.modes.get(.cursor_visible),
+        .style = @intCast(@intFromEnum(screen.cursor.cursor_style)),
+        .color = term.colors.cursor.get(),
+    };
+    if (self.damage.rows.items.len != screen.pages.rows) {
+        try self.damage.rows.resize(self.allocator, screen.pages.rows);
+        @memset(self.damage.rows.items, .{});
+        self.damage.invalidate();
+    }
+    if (self.damage.key == null or !std.meta.eql(self.damage.key.?, key) or
+        !std.meta.eql(term.flags.dirty, @as(@TypeOf(term.flags.dirty), .{})) or
+        !std.meta.eql(screen.dirty, @as(@TypeOf(screen.dirty), .{}))) self.damage.invalidate();
+    if (self.damage.cursor == null or !std.meta.eql(self.damage.cursor.?, cursor)) {
+        if (self.damage.cursor) |old| {
+            if (old.visible) self.damage.mark(old.y);
+        }
+        if (cursor.visible) self.damage.mark(cursor.y);
+    }
 
+    // Consume source damage only after recording it for BOTH buffers. Pins
+    // and serials detect rows moved/recycled by scrolling without dereferencing
+    // any saved page pointer.
+    var scan = screen.pages.rowIterator(.right_down, .{ .active = .{} }, null);
+    var row_index: usize = 0;
+    while (scan.next()) |pin| : (row_index += 1) {
+        if (row_index >= self.damage.rows.items.len) break;
+        const row = &self.damage.rows.items[row_index];
+        const node = @intFromPtr(pin.node);
+        if (row.node != node or row.serial != pin.node.serial or row.page_y != pin.y or
+            pin.node.page().dirty or pin.rowAndCell().row.dirty) self.damage.mark(row_index);
+        row.node = node;
+        row.serial = pin.node.serial;
+        row.page_y = pin.y;
+    }
+
+    const full = self.damage.full[self.render_index];
+    var changed = full;
+    if (full) self.clear(default_bg);
     var rows = screen.pages.rowIterator(.right_down, .{ .active = .{} }, null);
     var y: u32 = 0;
-    while (rows.next()) |pin| : (y += font.cell_height) {
-        if (y >= self.mode.vdisplay) break;
+    row_index = 0;
+    var redraw_cursor = false;
+    while (rows.next()) |pin| : ({
+        y += font.cell_height;
+        row_index += 1;
+    }) {
+        if (y >= self.mode.vdisplay or row_index >= self.damage.rows.items.len) break;
+        if (!self.damage.rows.items[row_index].pending[self.render_index]) continue;
+        changed = true;
+        if (row_index == cursor.y) redraw_cursor = true;
+        if (!full) self.fill_rect(default_bg, .{ .x = 0, .y = y, .width = self.mode.hdisplay, .height = font.cell_height });
         const cells = pin.cells(.all);
         // Paint backgrounds first so the trailing spacer never erases a wide glyph.
         for (cells, 0..) |*cell, column| {
@@ -300,6 +413,27 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !void {
         }
     }
 
+    if (redraw_cursor) try self.drawCursor(font, term);
+
+    // Keep accumulated damage intact if any drawing operation failed.
+    for (self.damage.rows.items) |*row| row.pending[self.render_index] = false;
+    self.damage.full[self.render_index] = false;
+    self.damage.key = key;
+    self.damage.cursor = cursor;
+    term.flags.dirty = .{};
+    screen.dirty = .{};
+    var clean = screen.pages.rowIterator(.right_down, .{ .active = .{} }, null);
+    row_index = 0;
+    while (clean.next()) |pin| : (row_index += 1) {
+        if (row_index >= self.damage.rows.items.len) break;
+        pin.rowAndCell().row.dirty = false;
+        pin.node.page().dirty = false;
+    }
+    return changed;
+}
+
+fn drawCursor(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !void {
+    const screen = term.screens.active;
     if (!term.modes.get(.cursor_visible)) return;
     var cursor_pin = screen.pages.pin(.{ .active = .{ .x = screen.cursor.x, .y = screen.cursor.y } }) orelse return;
     var cell = cursor_pin.rowAndCell().cell;
@@ -482,6 +616,7 @@ fn page_flip_handler(
 }
 
 pub fn deinit(self: *Self) void {
+    self.damage.deinit(self.allocator);
     // Normal shell exit already drains flips. Signals and error exits may not.
     if (self.flip_pending) self.finishPendingFlip();
     if (self.is_modeset) self.restoreCrtc();
@@ -536,6 +671,7 @@ fn testRenderer(pixels: []u32, width: u16, height: u16, stride: usize) Self {
     mode.hdisplay = width;
     mode.vdisplay = height;
     return .{
+        .allocator = std.testing.allocator,
         .fd = -1,
         .device = undefined,
         .mode = mode,
@@ -619,14 +755,201 @@ test "cached glyphs render with backgrounds, reverse colors and transparent pixe
     stream.nextSlice("\x1b[?25lA\x1b[41m \x1b[0m");
     var pixels = [_]u32{99} ** 8;
     var renderer = testRenderer(&pixels, 6, 1, 8);
-    try renderer.drawTerminal(&font, &term);
+    defer renderer.damage.deinit(renderer.allocator);
+    _ = try renderer.drawTerminal(&font, &term);
     const red = rgbPixel(term.colors.palette.current[1]);
     const fg = rgbPixel(Colors.foreground);
     try std.testing.expectEqualSlices(u32, &.{ fg, 0, red, red, 0, 0, 0, 0 }, &pixels);
 
     stream.nextSlice("\x1b[?5h");
-    try renderer.drawTerminal(&font, &term);
+    _ = try renderer.drawTerminal(&font, &term);
     try std.testing.expectEqualSlices(u32, &.{ 0, fg, red, red, fg, fg, fg, fg }, &pixels);
+}
+
+fn testFont() Font {
+    return .{
+        .allocator = std.testing.allocator,
+        .library = null,
+        .face = null,
+        .cell_width = 1,
+        .cell_height = 1,
+        .ascender = 0,
+    };
+}
+
+test "dirty rows leave clean pixels untouched and accumulate across both buffers" {
+    const allocator = std.testing.allocator;
+    var font = testFont();
+    var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 3 });
+    defer term.deinit(allocator);
+    try Colors.configure(&term, allocator);
+    var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?25l");
+    var pixels = [_][24]u32{[_]u32{99} ** 24} ** 2;
+    var renderer = testRenderer(&pixels[0], 4, 4, 6);
+    renderer.framebuffers[1].map = &pixels[1];
+    defer renderer.damage.deinit(allocator);
+    // Initialize both back buffers, just as successive page flips would.
+    try std.testing.expect(try renderer.drawTerminal(&font, &term));
+    renderer.completeFlip();
+    try std.testing.expect(try renderer.drawTerminal(&font, &term));
+    renderer.completeFlip();
+    try std.testing.expect(!try renderer.drawTerminal(&font, &term));
+
+    // A clean row must not be touched, not even by a full-screen clear.
+    pixels[0][12] = 0xDEADBEEF;
+    stream.nextSlice("\x1b[1;1H\x1b[41m \x1b[0m");
+    try std.testing.expect(try renderer.drawTerminal(&font, &term));
+    try std.testing.expectEqual(@as(u32, 0xDEADBEEF), pixels[0][12]);
+    try std.testing.expectEqual(@as(u32, 0xCD0000), pixels[0][0]);
+    try std.testing.expect(renderer.damage.rows.items[0].pending[1]);
+    try std.testing.expect(!renderer.damage.rows.items[1].pending[1]);
+    pixels[0][12] = 0;
+    renderer.completeFlip();
+
+    // The other buffer needs the previous row AND a newly dirtied row.
+    stream.nextSlice("\x1b[3;1H\x1b[44m \x1b[0m");
+    try std.testing.expect(try renderer.drawTerminal(&font, &term));
+    try std.testing.expectEqual(@as(u32, 0xCD0000), pixels[1][0]);
+    try std.testing.expectEqual(@as(u32, 0x0000EE), pixels[1][12]);
+    renderer.completeFlip();
+    stream.nextSlice("\x1b[2;1H\x1b[42m \x1b[0m");
+    try std.testing.expect(try renderer.drawTerminal(&font, &term));
+    try std.testing.expectEqual(@as(u32, 0xCD0000), pixels[0][0]);
+    try std.testing.expectEqual(@as(u32, 0x00CD00), pixels[0][6]);
+    try std.testing.expectEqual(@as(u32, 0x0000EE), pixels[0][12]);
+    renderer.completeFlip();
+    try std.testing.expect(try renderer.drawTerminal(&font, &term));
+    try std.testing.expectEqualSlices(u32, &pixels[0], &pixels[1]);
+    renderer.completeFlip();
+    // Nonvisual output must not submit another page flip once both match.
+    stream.nextSlice("\x1b]2;new title\x07");
+    try std.testing.expect(!try renderer.drawTerminal(&font, &term));
+}
+
+test "incremental frames match full redraws through cursor, color, screen and scroll changes" {
+    const allocator = std.testing.allocator;
+    var font = testFont();
+    var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 3 });
+    defer term.deinit(allocator);
+    try Colors.configure(&term, allocator);
+    var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
+    defer stream.deinit();
+    var pixels = [_][24]u32{[_]u32{99} ** 24} ** 2;
+    var expected = [_]u32{99} ** 24;
+    var renderer = testRenderer(&pixels[0], 4, 4, 6);
+    renderer.framebuffers[1].map = &pixels[1];
+    defer renderer.damage.deinit(allocator);
+    var reference = testRenderer(&expected, 4, 4, 6);
+    defer reference.damage.deinit(allocator);
+    const updates = [_][]const u8{
+        "\x1b[?25l",
+        "\x1b[41m \x1b[0m",
+        "\x1b[3;1H\x1b[44m \x1b[0m",
+        "\x1b[2;1H\x1b[42m \x1b[0m",
+        "\x1b[?25h\x1b[1;1H",
+        "\x1b[3;2H",
+        "\x1b[5 q",
+        "\x1b]12;#123456\x07",
+        "\x1b[3 q",
+        "\x1b[?25l",
+        "\x1b[1;1H\x1b[2K",
+        "\x1b]4;4;#abcdef\x07",
+        "\x1b]11;#010203\x07",
+        "\x1b]10;#654321\x07",
+        "\x1b[?5h",
+        "\x1b[?1049h\x1b[45m \x1b[0m",
+        "\x1b[?1049l",
+        "\x1b[3;1H\r\n",
+        "\x1b[1;3r\x1b[1;1H\x1b[L",
+        "\x1b[M",
+        "\x1b[2J",
+        "\x1bc",
+    };
+    for (updates) |update| {
+        stream.nextSlice(update);
+        const changed = try renderer.drawTerminal(&font, &term);
+        reference.damage.invalidate();
+        _ = try reference.drawTerminal(&font, &term);
+        try std.testing.expectEqualSlices(u32, &expected, &pixels[renderer.render_index]);
+        if (changed) renderer.completeFlip();
+    }
+    // Font/grid changes also repaint margins and clear now-uncovered pixels.
+    font.cell_height = 2;
+    _ = try renderer.drawTerminal(&font, &term);
+    reference.damage.invalidate();
+    _ = try reference.drawTerminal(&font, &term);
+    try std.testing.expectEqualSlices(u32, &expected, &pixels[renderer.render_index]);
+}
+
+test "pending flips retain source damage and wide cursor moves erase the old row" {
+    const allocator = std.testing.allocator;
+    var font = testFont();
+    defer font.glyphs.deinit(allocator);
+    const alpha = try allocator.dupe(u8, &.{ 255, 128 });
+    defer allocator.free(alpha);
+    try font.glyphs.put(allocator, '界', .{ .alpha = alpha, .width = 2, .rows = 1, .left = 0, .top = 0 });
+    var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 3 });
+    defer term.deinit(allocator);
+    try Colors.configure(&term, allocator);
+    var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
+    defer stream.deinit();
+    var pixels = [_][9]u32{[_]u32{99} ** 9} ** 2;
+    var renderer = testRenderer(&pixels[0], 3, 3, 3);
+    renderer.framebuffers[1].map = &pixels[1];
+    defer renderer.damage.deinit(allocator);
+    stream.nextSlice("\x1b[?25l界\x1b[1;2H\x1b[?25h");
+    _ = try renderer.drawTerminal(&font, &term);
+    renderer.flip_pending = true;
+    stream.nextSlice("\x1b[3;1H\x1b[44m \x1b[0m");
+    try std.testing.expectError(error.PageFlipPending, renderer.drawTerminal(&font, &term));
+    renderer.completeFlip();
+    _ = try renderer.drawTerminal(&font, &term);
+    renderer.completeFlip();
+    _ = try renderer.drawTerminal(&font, &term);
+    const fg = rgbPixel(Colors.foreground);
+    try std.testing.expectEqualSlices(u32, &.{ fg, blendPixel(0, fg, 128), 0 }, pixels[0][0..3]);
+    try std.testing.expectEqualSlices(u32, &pixels[0], &pixels[1]);
+    // Repainting an unchanged cursor would blend its glyph a second time.
+    try std.testing.expect(!try renderer.drawTerminal(&font, &term));
+    try std.testing.expectEqualSlices(u32, &pixels[0], &pixels[1]);
+}
+
+test "failed row drawing retains damage until a successful retry" {
+    const allocator = std.testing.allocator;
+    var font = testFont();
+    defer font.glyphs.deinit(allocator);
+    var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 3 });
+    defer term.deinit(allocator);
+    try Colors.configure(&term, allocator);
+    var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
+    defer stream.deinit();
+    var pixels = [_][9]u32{[_]u32{99} ** 9} ** 2;
+    var renderer = testRenderer(&pixels[0], 3, 3, 3);
+    renderer.framebuffers[1].map = &pixels[1];
+    defer renderer.damage.deinit(allocator);
+    stream.nextSlice("\x1b[?25l");
+    _ = try renderer.drawTerminal(&font, &term);
+    renderer.completeFlip();
+    _ = try renderer.drawTerminal(&font, &term);
+    renderer.completeFlip();
+    stream.nextSlice("\x1b[2;1HA");
+    // An uncached glyph on this synthetic font has no FreeType face to load.
+    try std.testing.expectError(error.GlyphLoadFailed, renderer.drawTerminal(&font, &term));
+    try std.testing.expect(renderer.damage.rows.items[1].pending[0]);
+    try std.testing.expect(renderer.damage.rows.items[1].pending[1]);
+    const pin = term.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?;
+    try std.testing.expect(pin.rowAndCell().row.dirty);
+    const alpha = try allocator.dupe(u8, &.{255});
+    defer allocator.free(alpha);
+    try font.glyphs.put(allocator, 'A', .{ .alpha = alpha, .width = 1, .rows = 1, .left = 0, .top = 0 });
+    try std.testing.expect(try renderer.drawTerminal(&font, &term));
+    try std.testing.expect(!pin.rowAndCell().row.dirty);
+    try std.testing.expectEqual(rgbPixel(Colors.foreground), pixels[0][3]);
+    renderer.completeFlip();
+    _ = try renderer.drawTerminal(&font, &term);
+    try std.testing.expectEqualSlices(u32, &pixels[0], &pixels[1]);
 }
 
 test "SGR colors preserve indexed and RGB values and apply intensity and inverse" {
