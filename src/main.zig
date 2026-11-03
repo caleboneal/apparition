@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
         .pixel_size = config.font_size,
     });
     defer font.deinit();
-    var input = try Input.init();
+    var input = try Input.init(.init(config.repeat_delay_ms, config.repeat_rate));
     defer input.deinit();
 
     const cols: u16 = @intCast(renderer.mode.hdisplay / font.cell_width);
@@ -151,7 +151,8 @@ pub fn main(init: std.process.Init) !void {
     while (!stopping.load(.monotonic)) {
         if (!pty_closed) {
             input.keyboard.application_cursor = term.modes.get(.cursor_keys);
-            while (try input.next(&keys)) |bytes| try pty.queue(bytes);
+            const now = std.Io.Clock.awake.now(io).toNanoseconds();
+            while (try input.next(now, &keys)) |bytes| try pty.queue(bytes);
             try pty.flush();
         }
 
@@ -161,7 +162,11 @@ pub fn main(init: std.process.Init) !void {
             .{ .fd = if (pty_closed) -1 else input.fd, .events = c.POLLIN, .revents = 0 },
             .{ .fd = if (renderer.flip_pending) renderer.fd else -1, .events = c.POLLIN, .revents = 0 },
         };
-        const timeout = pacing.timeoutMs(std.Io.Clock.awake.now(io).toNanoseconds(), renderer.flip_pending);
+        const poll_now = std.Io.Clock.awake.now(io).toNanoseconds();
+        var timeout = pacing.timeoutMs(poll_now, renderer.flip_pending);
+        if (!pty_closed) {
+            if (input.repeat.timeoutMs(poll_now)) |repeat_ms| timeout = @min(timeout, repeat_ms);
+        }
         if (c.poll(&fds, fds.len, timeout) < 0) {
             if (Pty.errno() == c.EINTR) continue;
             return error.PollFailed;

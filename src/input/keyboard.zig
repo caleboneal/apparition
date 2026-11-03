@@ -35,11 +35,14 @@ pub fn deinit(self: *Self) void {
 
 /// Accept an evdev keycode and update XKB on both press and release.
 pub fn key(self: *Self, evdev_key: u32, pressed: bool, buffer: []u8) !?[]const u8 {
-    // XKB's evdev keymap reserves the first eight keycodes.
-    const code = evdev_key + 8;
-    _ = xkb.xkb_state_update_key(self.state, code, if (pressed) xkb.XKB_KEY_DOWN else xkb.XKB_KEY_UP);
+    _ = xkb.xkb_state_update_key(self.state, xkbCode(evdev_key), if (pressed) xkb.XKB_KEY_DOWN else xkb.XKB_KEY_UP);
     if (!pressed) return null;
+    return self.repeat(evdev_key, buffer);
+}
 
+/// Encode a held key with the current modifiers, without updating XKB state.
+pub fn repeat(self: *Self, evdev_key: u32, buffer: []u8) !?[]const u8 {
+    const code = xkbCode(evdev_key);
     return encode(
         xkb.xkb_state_key_get_one_sym(self.state, code),
         self.modActive(xkb.XKB_MOD_NAME_CTRL),
@@ -48,6 +51,16 @@ pub fn key(self: *Self, evdev_key: u32, pressed: bool, buffer: []u8) !?[]const u
         self.application_cursor,
         buffer,
     );
+}
+
+/// Whether the keymap lets this key auto-repeat; modifiers and locks do not.
+pub fn repeats(self: *Self, evdev_key: u32) bool {
+    return xkb.xkb_keymap_key_repeats(self.keymap, xkbCode(evdev_key)) != 0;
+}
+
+fn xkbCode(evdev_key: u32) xkb.xkb_keycode_t {
+    // XKB's evdev keymap reserves the first eight keycodes.
+    return evdev_key + 8;
 }
 
 fn modActive(self: *Self, name: [*:0]const u8) bool {
@@ -180,4 +193,22 @@ test "XKB tracks modifier presses and releases" {
     _ = try keyboard.key(29, false, &buffer);
     _ = try keyboard.key(56, false, &buffer);
     try std.testing.expectEqualStrings("a", (try keyboard.key(30, true, &buffer)).?);
+}
+
+test "repeats re-encode held keys with current modifiers" {
+    var keyboard = try initWithNames(&.{ .layout = "us" });
+    defer keyboard.deinit();
+    var buffer: [5]u8 = undefined;
+
+    // Evdev: A = 30, left shift = 42, up = 103.
+    try std.testing.expect(keyboard.repeats(30));
+    try std.testing.expect(keyboard.repeats(103));
+    try std.testing.expect(!keyboard.repeats(42));
+
+    _ = try keyboard.key(30, true, &buffer);
+    try std.testing.expectEqualStrings("a", (try keyboard.repeat(30, &buffer)).?);
+    _ = try keyboard.key(42, true, &buffer);
+    try std.testing.expectEqualStrings("A", (try keyboard.repeat(30, &buffer)).?);
+    keyboard.application_cursor = true;
+    try std.testing.expectEqualStrings("\x1bOA", (try keyboard.repeat(103, &buffer)).?);
 }

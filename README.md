@@ -28,7 +28,10 @@ when possible.
 Keyboards are discovered through libinput/udev. Input supports UTF-8, Shift,
 Ctrl combinations such as Ctrl-C/Ctrl-D, Alt, Enter, Backspace, Tab, Escape,
 and navigation keys, including application-cursor mode. XKB uses the default
-layout, configurable through `XKB_DEFAULT_*` environment variables.
+layout, configurable through `XKB_DEFAULT_*` environment variables. Held keys
+autorepeat after `repeat_delay_ms` (600 ms) at `repeat_rate` (25 per second),
+both set in `src/config.zig`; a rate of 0 disables autorepeat. Modifiers do
+not repeat, and repeats use the current modifiers.
 
 Use `exit` or Ctrl-D at an empty shell prompt to close the terminal. Normal
 shutdown restores the previous display and console keyboard modes and reaps
@@ -43,7 +46,7 @@ the old and new cursor rows. Screen, palette, default-color, and grid changes
 trigger full redraws (including display margins). Once the back buffer is
 current, nonvisual output does not cause another page flip.
 
-This is still rudimentary: no key autorepeat, scrollback UI, mouse input,
+This is still rudimentary: no scrollback UI, mouse input,
 clipboard, IME/compose, font fallback, grapheme shaping, or display hotplug/
 resize handling. Rendering uses the first codepoint of each grapheme. Bold,
 italic, and bold-italic text use separate font faces. Underlines support single,
@@ -93,7 +96,8 @@ zig build test
 ```
 
 Tests cover PTY shell startup and sizing, exec failure, queued input,
-terminal parsing/replies, keyboard translation, DRM routing helpers, and
+terminal parsing/replies, keyboard translation and autorepeat timing, DRM
+routing helpers, and
 incremental rendering without requiring DRM or input hardware. Renderer tests
 compare dirty-row frames against full redraws through buffer flips, cursor
 changes, scrolling, screen switches, color changes, and drawing-error retries.
