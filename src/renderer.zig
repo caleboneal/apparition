@@ -218,6 +218,8 @@ render_index: usize = 0,
 flip_pending: bool = false,
 saved_crtc: ?*libdrm.drmModeCrtc,
 is_modeset: bool = false,
+/// False while another VT owns the display; do not present until activate.
+active: bool = true,
 
 pub fn init(allocator: std.mem.Allocator) !Self {
     var device = try Drm.Device.init();
@@ -688,6 +690,24 @@ pub fn handleEvents(self: *Self) !void {
     if (result != 0 and std.posix.errno(result) != .INTR) return error.FailedToHandleDrmEvent;
 }
 
+/// Give the display to another VT: finish any flip, then drop DRM master.
+/// The CRTC is left for the next master to program.
+pub fn deactivate(self: *Self) void {
+    if (self.flip_pending) self.finishPendingFlip();
+    if (libdrm.drmDropMaster(self.fd) != 0)
+        std.log.warn("Failed to drop DRM master: errno {d}", .{std.c._errno().*});
+    self.active = false;
+}
+
+/// Retake DRM master after returning to this VT. The next present modesets
+/// and the next draw repaints everything, since another master owned the CRTC.
+pub fn activate(self: *Self) !void {
+    if (libdrm.drmSetMaster(self.fd) != 0) return error.DrmMasterUnavailable;
+    self.active = true;
+    self.display_index = null;
+    self.damage.invalidate();
+}
+
 pub fn frameIntervalNs(self: *const Self) u64 {
     var refresh: u64 = self.mode.vrefresh;
     if (refresh == 0) refresh = 60;
@@ -713,7 +733,8 @@ pub fn deinit(self: *Self) void {
     self.damage.deinit(self.allocator);
     // Normal shell exit already drains flips. Signals and error exits may not.
     if (self.flip_pending) self.finishPendingFlip();
-    if (self.is_modeset) self.restoreCrtc();
+    // While switched away, the display belongs to the active VT.
+    if (self.is_modeset and self.active) self.restoreCrtc();
     if (self.saved_crtc) |saved_crtc| libdrm.drmModeFreeCrtc(saved_crtc);
 
     for (self.framebuffers) |framebuffer| destroyFramebuffer(self.fd, framebuffer);

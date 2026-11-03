@@ -57,7 +57,8 @@ pub const Device = struct {
         libdrm.drmModeFreeEncoder(self.encoder);
         libdrm.drmModeFreeConnector(self.connector);
         libdrm.drmModeFreeResources(self.resources);
-        if (libdrm.drmDropMaster(self.fd) != 0)
+        // Master may already have been dropped for a VT switch.
+        if (libdrm.drmIsMaster(self.fd) == 1 and libdrm.drmDropMaster(self.fd) != 0)
             log.warn("Failed to drop DRM master on fd {d}: errno {d}", .{ self.fd, std.c._errno().* });
         _ = linux.close(self.fd);
         self.* = undefined;

@@ -53,6 +53,13 @@ pub fn repeat(self: *Self, evdev_key: u32, buffer: []u8) !?[]const u8 {
     );
 }
 
+/// The VT a pressed key requests, such as Ctrl+Alt+F2 in the default keymap.
+pub fn switchTarget(self: *Self, evdev_key: u32) ?u8 {
+    const sym = xkb.xkb_state_key_get_one_sym(self.state, xkbCode(evdev_key));
+    if (sym < xkb.XKB_KEY_XF86Switch_VT_1 or sym > xkb.XKB_KEY_XF86Switch_VT_12) return null;
+    return @intCast(sym - xkb.XKB_KEY_XF86Switch_VT_1 + 1);
+}
+
 /// Whether the keymap lets this key auto-repeat; modifiers and locks do not.
 pub fn repeats(self: *Self, evdev_key: u32) bool {
     return xkb.xkb_keymap_key_repeats(self.keymap, xkbCode(evdev_key)) != 0;
@@ -193,6 +200,25 @@ test "XKB tracks modifier presses and releases" {
     _ = try keyboard.key(29, false, &buffer);
     _ = try keyboard.key(56, false, &buffer);
     try std.testing.expectEqualStrings("a", (try keyboard.key(30, true, &buffer)).?);
+}
+
+test "Ctrl+Alt+function keys request VT switches" {
+    var keyboard = try initWithNames(&.{ .layout = "us" });
+    defer keyboard.deinit();
+    var buffer: [5]u8 = undefined;
+
+    // Evdev: F1 = 59, F2 = 60, F12 = 88, left ctrl = 29, left alt = 56.
+    _ = try keyboard.key(60, true, &buffer);
+    try std.testing.expectEqual(@as(?u8, null), keyboard.switchTarget(60));
+    _ = try keyboard.key(60, false, &buffer);
+    _ = try keyboard.key(29, true, &buffer);
+    _ = try keyboard.key(56, true, &buffer);
+    for ([_]u32{ 59, 60, 88 }, [_]u8{ 1, 2, 12 }) |evdev_key, vt| {
+        try std.testing.expectEqual(@as(?[]const u8, null), try keyboard.key(evdev_key, true, &buffer));
+        try std.testing.expectEqual(@as(?u8, vt), keyboard.switchTarget(evdev_key));
+        _ = try keyboard.key(evdev_key, false, &buffer);
+    }
+    try std.testing.expectEqual(@as(?u8, null), keyboard.switchTarget(30));
 }
 
 test "repeats re-encode held keys with current modifiers" {

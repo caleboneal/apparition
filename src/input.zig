@@ -106,11 +106,32 @@ pub fn deinit(self: *Self) void {
     _ = libinput.libinput_unref(self.context);
 }
 
-/// Dispatch and drain events until a key produces bytes, then emit a due
-/// autorepeat, or return null if neither. now_ns uses the awake clock.
-/// The returned slice aliases buffer. Five bytes suffice for every supported key.
+/// Close input devices while another VT owns the seat. libinput synthesizes
+/// releases for held keys, which are applied now so modifiers do not stick.
+pub fn deactivate(self: *Self) !void {
+    libinput.libinput_suspend(self.context);
+    var discard: [16]u8 = undefined;
+    while (try self.next(0, &discard)) |_| {}
+    self.repeat.key = null;
+}
+
+/// Reopen input devices after returning to this VT.
+pub fn activate(self: *Self) !void {
+    if (libinput.libinput_resume(self.context) != 0) return error.LibinputResumeFailed;
+}
+
+pub const Event = union(enum) {
+    /// Aliases the buffer passed to next.
+    bytes: []const u8,
+    /// A key combination such as Ctrl+Alt+F2 requested this VT number.
+    switch_vt: u8,
+};
+
+/// Dispatch and drain events until a key produces bytes or a VT switch, then
+/// emit a due autorepeat, or return null if none. now_ns uses the awake clock.
+/// Five bytes suffice for every supported key.
 /// BufferTooSmall consumes the key event, but still updates its modifier state.
-pub fn next(self: *Self, now_ns: i96, buffer: []u8) !?[]const u8 {
+pub fn next(self: *Self, now_ns: i96, buffer: []u8) !?Event {
     if (libinput.libinput_dispatch(self.context) != 0)
         return error.LibinputDispatchFailed;
 
@@ -126,14 +147,20 @@ pub fn next(self: *Self, now_ns: i96, buffer: []u8) !?[]const u8 {
         if ((pressed and count != 1) or (!pressed and count != 0)) continue;
 
         const key = libinput.libinput_event_keyboard_get_key(key_event);
-        if (!pressed) {
-            self.repeat.release(key);
-        } else if (self.keyboard.repeats(key)) {
-            self.repeat.press(key, now_ns);
+        if (!pressed) self.repeat.release(key);
+        const bytes = try self.keyboard.key(key, pressed, buffer);
+        if (pressed) {
+            if (self.keyboard.switchTarget(key)) |vt| {
+                self.repeat.key = null;
+                return .{ .switch_vt = vt };
+            }
+            if (self.keyboard.repeats(key)) self.repeat.press(key, now_ns);
         }
-        if (try self.keyboard.key(key, pressed, buffer)) |bytes| return bytes;
+        if (bytes) |b| return .{ .bytes = b };
     }
-    if (self.repeat.due(now_ns)) |key| return self.keyboard.repeat(key, buffer);
+    if (self.repeat.due(now_ns)) |key| {
+        if (try self.keyboard.repeat(key, buffer)) |bytes| return .{ .bytes = bytes };
+    }
     return null;
 }
 

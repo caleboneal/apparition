@@ -4,6 +4,7 @@ const Input = @import("input.zig");
 const Config = @import("config.zig");
 const Colors = @import("colors.zig");
 const Pty = @import("pty.zig");
+const Vt = @import("vt.zig");
 const c = Pty.c;
 const ghosttyvt = @import("ghostty-vt");
 
@@ -137,6 +138,15 @@ pub fn main(init: std.process.Init) !void {
         _ = console.ioctl(0, console.KDSETMODE, display_mode);
     };
 
+    // With the console keyboard off, the kernel no longer handles Ctrl+Alt+Fn,
+    // so switch VTs ourselves and hand over the display and input on request.
+    var vt: ?Vt = if (has_display_mode) Vt.init(0) catch |err| blk: {
+        std.log.warn("VT switching unavailable: {s}", .{@errorName(err)});
+        break :blk null;
+    } else null;
+    defer if (vt) |*v| v.deinit();
+    var display_retry = false;
+
     _ = try renderer.drawTerminal(&font, &term);
     try renderer.present();
 
@@ -149,10 +159,37 @@ pub fn main(init: std.process.Init) !void {
     var output: [4096]u8 = undefined;
     var keys: [64]u8 = undefined;
     while (!stopping.load(.monotonic)) {
+        if (vt) |*v| {
+            while (v.next()) |event| switch (event) {
+                .release => if (v.active) {
+                    renderer.deactivate();
+                    try input.deactivate();
+                    v.release();
+                },
+                .acquire => if (!v.active) {
+                    v.acquire();
+                    try input.activate();
+                    display_retry = false;
+                },
+            };
+            // The previous VT's owner may still hold DRM master briefly.
+            if (v.active and !renderer.active) {
+                if (renderer.activate()) {
+                    pacing.dirty = true;
+                } else |err| if (!display_retry) {
+                    std.log.warn("Cannot retake display, retrying: {s}", .{@errorName(err)});
+                    display_retry = true;
+                }
+            }
+        }
+
         if (!pty_closed) {
             input.keyboard.application_cursor = term.modes.get(.cursor_keys);
             const now = std.Io.Clock.awake.now(io).toNanoseconds();
-            while (try input.next(now, &keys)) |bytes| try pty.queue(bytes);
+            while (try input.next(now, &keys)) |event| switch (event) {
+                .bytes => |bytes| try pty.queue(bytes),
+                .switch_vt => |number| if (vt) |*v| v.activate(number),
+            };
             try pty.flush();
         }
 
@@ -161,9 +198,12 @@ pub fn main(init: std.process.Init) !void {
             .{ .fd = if (pty_closed) -1 else pty.fd, .events = @intCast(c.POLLIN | (if (pty.wantsWrite()) c.POLLOUT else @as(c_int, 0))), .revents = 0 },
             .{ .fd = if (pty_closed) -1 else input.fd, .events = c.POLLIN, .revents = 0 },
             .{ .fd = if (renderer.flip_pending) renderer.fd else -1, .events = c.POLLIN, .revents = 0 },
+            .{ .fd = if (vt) |v| v.fd else -1, .events = c.POLLIN, .revents = 0 },
         };
+        // Drawing waits for both a free buffer and ownership of the display.
+        const display_blocked = renderer.flip_pending or !renderer.active;
         const poll_now = std.Io.Clock.awake.now(io).toNanoseconds();
-        var timeout = pacing.timeoutMs(poll_now, renderer.flip_pending);
+        var timeout = pacing.timeoutMs(poll_now, display_blocked);
         if (!pty_closed) {
             if (input.repeat.timeoutMs(poll_now)) |repeat_ms| timeout = @min(timeout, repeat_ms);
         }
@@ -199,14 +239,15 @@ pub fn main(init: std.process.Init) !void {
             }
             if (drained and pty.exited()) pty_closed = true;
         }
-        if (pacing.ready(std.Io.Clock.awake.now(io).toNanoseconds(), renderer.flip_pending)) {
+        if (pacing.ready(std.Io.Clock.awake.now(io).toNanoseconds(), renderer.flip_pending or !renderer.active)) {
             if (try renderer.drawTerminal(&font, &term)) try renderer.present();
             pacing.presented(std.Io.Clock.awake.now(io).toNanoseconds());
         }
         // EOF must not discard updates coalesced behind a pending flip. Wait
         // for the final frame's completion before tearing down the renderer.
         // An explicit termination signal still cancels this graceful drain.
-        if (pty_closed and !pacing.dirty and !renderer.flip_pending) break;
+        // While switched away, nothing can be shown, so exit immediately.
+        if (pty_closed and (!pacing.dirty or !renderer.active) and !renderer.flip_pending) break;
     }
 }
 
@@ -267,4 +308,5 @@ test {
     _ = @import("pty.zig");
     _ = @import("input/keyboard.zig");
     _ = @import("renderer.zig");
+    _ = @import("vt.zig");
 }

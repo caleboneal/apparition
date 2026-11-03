@@ -33,6 +33,13 @@ autorepeat after `repeat_delay_ms` (600 ms) at `repeat_rate` (25 per second),
 both set in `src/config.zig`; a rate of 0 disables autorepeat. Modifiers do
 not repeat, and repeats use the current modifiers.
 
+Ctrl+Alt+F1 through F12 switch virtual terminals (following the keymap's
+`XF86Switch_VT_*` keysyms). When launched from a VT, Apparition takes over that
+VT's switching (`VT_PROCESS`): switching away finishes any pending page flip,
+drops DRM master, and closes input devices; switching back retakes them and
+does a full modeset and redraw. If the shell exits while another VT is active,
+Apparition quits without touching the display.
+
 Use `exit` or Ctrl-D at an empty shell prompt to close the terminal. Normal
 shutdown restores the previous display and console keyboard modes and reaps
 the shell. The event loop polls PTY, input, and pending DRM page-flip events
@@ -96,8 +103,8 @@ zig build test
 ```
 
 Tests cover PTY shell startup and sizing, exec failure, queued input,
-terminal parsing/replies, keyboard translation and autorepeat timing, DRM
-routing helpers, and
+terminal parsing/replies, keyboard translation and autorepeat timing, VT
+switch keys and request signaling, DRM routing helpers, and
 incremental rendering without requiring DRM or input hardware. Renderer tests
 compare dirty-row frames against full redraws through buffer flips, cursor
 changes, scrolling, screen switches, color changes, and drawing-error retries.

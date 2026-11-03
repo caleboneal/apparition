@@ -1,6 +1,9 @@
 const std = @import("std");
 
 pub const c = @cImport({
+    // Optimized builds define _FORTIFY_SOURCE, whose glibc open() wrappers use
+    // GCC builtins that translate-c rejects. Fortification only affects C callers.
+    @cUndef("_FORTIFY_SOURCE");
     @cDefine("_GNU_SOURCE", "1");
     @cInclude("errno.h");
     @cInclude("fcntl.h");
