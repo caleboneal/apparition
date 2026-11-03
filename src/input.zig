@@ -125,9 +125,11 @@ pub const Event = union(enum) {
     bytes: []const u8,
     /// A key combination such as Ctrl+Alt+F2 requested this VT number.
     switch_vt: u8,
+    /// A key combination such as Shift+PageUp requested moving the viewport.
+    scroll: Keyboard.Scroll,
 };
 
-/// Dispatch and drain events until a key produces bytes or a VT switch, then
+/// Dispatch and drain events until a key produces bytes or an action, then
 /// emit a due autorepeat, or return null if none. now_ns uses the awake clock.
 /// Five bytes suffice for every supported key.
 /// BufferTooSmall consumes the key event, but still updates its modifier state.
@@ -155,10 +157,12 @@ pub fn next(self: *Self, now_ns: i96, buffer: []u8) !?Event {
                 return .{ .switch_vt = vt };
             }
             if (self.keyboard.repeats(key)) self.repeat.press(key, now_ns);
+            if (self.keyboard.scrollAction(key)) |scroll| return .{ .scroll = scroll };
         }
         if (bytes) |b| return .{ .bytes = b };
     }
     if (self.repeat.due(now_ns)) |key| {
+        if (self.keyboard.scrollAction(key)) |scroll| return .{ .scroll = scroll };
         if (try self.keyboard.repeat(key, buffer)) |bytes| return .{ .bytes = bytes };
     }
     return null;

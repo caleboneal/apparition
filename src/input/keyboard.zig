@@ -10,6 +10,10 @@ context: *xkb.xkb_context,
 keymap: *xkb.xkb_keymap,
 state: *xkb.xkb_state,
 application_cursor: bool = false,
+/// Whether the active screen keeps history. Without it, scroll keys reach the application.
+scrollback: bool = true,
+
+pub const Scroll = enum { page_up, page_down, top, bottom };
 
 /// Use XKB's default rules/layout, including XKB_DEFAULT_* environment settings.
 pub fn init() !Self {
@@ -58,6 +62,19 @@ pub fn switchTarget(self: *Self, evdev_key: u32) ?u8 {
     const sym = xkb.xkb_state_key_get_one_sym(self.state, xkbCode(evdev_key));
     if (sym < xkb.XKB_KEY_XF86Switch_VT_1 or sym > xkb.XKB_KEY_XF86Switch_VT_12) return null;
     return @intCast(sym - xkb.XKB_KEY_XF86Switch_VT_1 + 1);
+}
+
+/// Shift+PageUp/PageDown/Home/End scroll history instead of reaching the application.
+pub fn scrollAction(self: *Self, evdev_key: u32) ?Scroll {
+    if (!self.scrollback or !self.modActive(xkb.XKB_MOD_NAME_SHIFT) or
+        self.modActive(xkb.XKB_MOD_NAME_CTRL) or self.modActive(xkb.XKB_MOD_NAME_ALT)) return null;
+    return switch (xkb.xkb_state_key_get_one_sym(self.state, xkbCode(evdev_key))) {
+        xkb.XKB_KEY_Page_Up => .page_up,
+        xkb.XKB_KEY_Page_Down => .page_down,
+        xkb.XKB_KEY_Home => .top,
+        xkb.XKB_KEY_End => .bottom,
+        else => null,
+    };
 }
 
 /// Whether the keymap lets this key auto-repeat; modifiers and locks do not.
@@ -219,6 +236,30 @@ test "Ctrl+Alt+function keys request VT switches" {
         _ = try keyboard.key(evdev_key, false, &buffer);
     }
     try std.testing.expectEqual(@as(?u8, null), keyboard.switchTarget(30));
+}
+
+test "Shift+navigation keys scroll only when the screen has scrollback" {
+    var keyboard = try initWithNames(&.{ .layout = "us" });
+    defer keyboard.deinit();
+    var buffer: [5]u8 = undefined;
+
+    // Evdev: page up = 104, page down = 109, home = 102, end = 107,
+    // left shift = 42, left ctrl = 29.
+    _ = try keyboard.key(104, true, &buffer);
+    try std.testing.expectEqual(@as(?Scroll, null), keyboard.scrollAction(104));
+    _ = try keyboard.key(104, false, &buffer);
+    _ = try keyboard.key(42, true, &buffer);
+    for ([_]u32{ 104, 109, 102, 107 }, [_]Scroll{ .page_up, .page_down, .top, .bottom }) |evdev_key, action| {
+        _ = try keyboard.key(evdev_key, true, &buffer);
+        try std.testing.expectEqual(@as(?Scroll, action), keyboard.scrollAction(evdev_key));
+        _ = try keyboard.key(evdev_key, false, &buffer);
+    }
+    try std.testing.expectEqual(@as(?Scroll, null), keyboard.scrollAction(30));
+    keyboard.scrollback = false;
+    try std.testing.expectEqual(@as(?Scroll, null), keyboard.scrollAction(104));
+    keyboard.scrollback = true;
+    _ = try keyboard.key(29, true, &buffer);
+    try std.testing.expectEqual(@as(?Scroll, null), keyboard.scrollAction(104));
 }
 
 test "repeats re-encode held keys with current modifiers" {

@@ -33,6 +33,13 @@ autorepeat after `repeat_delay_ms` (600 ms) at `repeat_rate` (25 per second),
 both set in `src/config.zig`; a rate of 0 disables autorepeat. Modifiers do
 not repeat, and repeats use the current modifiers.
 
+Shift+PageUp and Shift+PageDown scroll through history a page at a time, and
+Shift+Home and Shift+End jump to the oldest line or back to the live screen.
+Any key that sends input also returns to the live screen; new output does not
+move a scrolled-back view. History keeps `scrollback_lines` (10,000) lines, set
+in `src/config.zig`; 0 disables it. The alternate screen used by full-screen
+programs has no history, so these keys reach the program there.
+
 Ctrl+Alt+F1 through F12 switch virtual terminals (following the keymap's
 `XF86Switch_VT_*` keysyms). When launched from a VT, Apparition takes over that
 VT's switching (`VT_PROCESS`): switching away finishes any pending page flip,
@@ -53,7 +60,7 @@ the old and new cursor rows. Screen, palette, default-color, and grid changes
 trigger full redraws (including display margins). Once the back buffer is
 current, nonvisual output does not cause another page flip.
 
-This is still rudimentary: no scrollback UI, mouse input,
+This is still rudimentary: no mouse input,
 clipboard, IME/compose, font fallback, grapheme shaping, or display hotplug/
 resize handling. Rendering uses the first codepoint of each grapheme. Bold,
 italic, and bold-italic text use separate font faces. Underlines support single,
@@ -107,6 +114,7 @@ terminal parsing/replies, keyboard translation and autorepeat timing, VT
 switch keys and request signaling, DRM routing helpers, and
 incremental rendering without requiring DRM or input hardware. Renderer tests
 compare dirty-row frames against full redraws through buffer flips, cursor
-changes, scrolling, screen switches, color changes, and drawing-error retries.
+changes, scrolling, scrollback viewports, screen switches, color changes, and
+drawing-error retries.
 Font tests load bundled and external families, verify independent style caches,
 and cover styled block cursors and underlines on spaces and wide cells.

@@ -403,7 +403,15 @@ fn drawGlyph(self: *Self, font: *Font, codepoint: u21, style: FontStyle, rect: R
     }
 }
 
-/// Redraw damaged active-screen rows, without presenting. Returns false when
+/// The cursor's row within the viewport, or null when scrolled out of view.
+fn cursorRow(screen: *ghosttyvt.Screen) ?u16 {
+    if (screen.viewportIsBottom()) return screen.cursor.y;
+    const point = screen.pages.pointFromPin(.viewport, screen.cursor.page_pin.*) orelse return null;
+    const y = point.coord().y;
+    return if (y < screen.pages.rows) @intCast(y) else null;
+}
+
+/// Redraw damaged viewport rows, without presenting. Returns false when
 /// the back buffer already matches the terminal and no page flip is needed.
 /// The terminal already decoded UTF-8; only the first codepoint of each
 /// grapheme is rendered. Shaping, fallback fonts, and cursor blinking are not implemented.
@@ -424,10 +432,11 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
         .fg = rgbPixel(defaults.fg),
         .bg = default_bg,
     };
+    const cursor_row = cursorRow(screen);
     const cursor: CursorState = .{
         .x = screen.cursor.x,
-        .y = screen.cursor.y,
-        .visible = term.modes.get(.cursor_visible),
+        .y = cursor_row orelse 0,
+        .visible = term.modes.get(.cursor_visible) and cursor_row != null,
         .style = @intCast(@intFromEnum(screen.cursor.cursor_style)),
         .color = term.colors.cursor.get(),
     };
@@ -447,9 +456,9 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
     }
 
     // Consume source damage only after recording it for BOTH buffers. Pins
-    // and serials detect rows moved/recycled by scrolling without dereferencing
-    // any saved page pointer.
-    var scan = screen.pages.rowIterator(.right_down, .{ .active = .{} }, null);
+    // and serials detect rows moved/recycled by scrolling, including viewport
+    // scrolling, without dereferencing any saved page pointer.
+    var scan = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
     var row_index: usize = 0;
     while (scan.next()) |pin| : (row_index += 1) {
         if (row_index >= self.damage.rows.items.len) break;
@@ -465,7 +474,7 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
     const full = self.damage.full[self.render_index];
     var changed = full;
     if (full) self.clear(default_bg);
-    var rows = screen.pages.rowIterator(.right_down, .{ .active = .{} }, null);
+    var rows = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
     var y: u32 = 0;
     row_index = 0;
     var redraw_cursor = false;
@@ -476,7 +485,7 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
         if (y >= self.mode.vdisplay or row_index >= self.damage.rows.items.len) break;
         if (!self.damage.rows.items[row_index].pending[self.render_index]) continue;
         changed = true;
-        if (row_index == cursor.y) redraw_cursor = true;
+        if (cursor.visible and row_index == cursor.y) redraw_cursor = true;
         if (!full) self.fill_rect(default_bg, .{ .x = 0, .y = y, .width = self.mode.hdisplay, .height = font.cell_height });
         const cells = pin.cells(.all);
         // Paint backgrounds first so the trailing spacer never erases a wide glyph.
@@ -506,7 +515,7 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
         }
     }
 
-    if (redraw_cursor) try self.drawCursor(font, term);
+    if (redraw_cursor) try self.drawCursor(font, term, cursor.y);
 
     // Keep accumulated damage intact if any drawing operation failed.
     for (self.damage.rows.items) |*row| row.pending[self.render_index] = false;
@@ -515,7 +524,7 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
     self.damage.cursor = cursor;
     term.flags.dirty = .{};
     screen.dirty = .{};
-    var clean = screen.pages.rowIterator(.right_down, .{ .active = .{} }, null);
+    var clean = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
     row_index = 0;
     while (clean.next()) |pin| : (row_index += 1) {
         if (row_index >= self.damage.rows.items.len) break;
@@ -525,10 +534,10 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
     return changed;
 }
 
-fn drawCursor(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !void {
+fn drawCursor(self: *Self, font: *Font, term: *ghosttyvt.Terminal, row: u16) !void {
     const screen = term.screens.active;
     if (!term.modes.get(.cursor_visible)) return;
-    var cursor_pin = screen.pages.pin(.{ .active = .{ .x = screen.cursor.x, .y = screen.cursor.y } }) orelse return;
+    var cursor_pin = screen.pages.pin(.{ .viewport = .{ .x = screen.cursor.x, .y = row } }) orelse return;
     var cell = cursor_pin.rowAndCell().cell;
     // A cursor on the trailing half of a wide glyph covers the whole glyph.
     if (cell.wide == .spacer_tail and cursor_pin.x > 0) {
@@ -536,7 +545,7 @@ fn drawCursor(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !void {
         cell = cursor_pin.rowAndCell().cell;
     }
     const x = @as(u64, cursor_pin.x) * font.cell_width;
-    const cursor_y = @as(u64, screen.cursor.y) * font.cell_height;
+    const cursor_y = @as(u64, row) * font.cell_height;
     if (x >= self.mode.hdisplay or cursor_y >= self.mode.vdisplay) return;
     const style = cursor_pin.style(cell);
     const colors = cellColors(cell.*, style, term);
@@ -1157,6 +1166,62 @@ test "incremental frames match full redraws through cursor, color, screen and sc
     reference.damage.invalidate();
     _ = try reference.drawTerminal(&font, &term);
     try std.testing.expectEqualSlices(u32, &expected, &pixels[renderer.render_index]);
+}
+
+test "scrolled viewports render history and hide an off-screen cursor" {
+    const allocator = std.testing.allocator;
+    var font = testFont();
+    var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 3, .max_scrollback_bytes = null });
+    defer term.deinit(allocator);
+    try Colors.configure(&term, allocator);
+    var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
+    defer stream.deinit();
+    var pixels = [_][9]u32{[_]u32{99} ** 9} ** 2;
+    var expected = [_]u32{99} ** 9;
+    var renderer = testRenderer(&pixels[0], 3, 3, 3);
+    renderer.framebuffers[1].map = &pixels[1];
+    defer renderer.damage.deinit(allocator);
+    var reference = testRenderer(&expected, 3, 3, 3);
+    defer reference.damage.deinit(allocator);
+
+    const Step = union(enum) { output: []const u8, scroll: ghosttyvt.Terminal.ScrollViewport };
+    const steps = [_]Step{
+        // Five rows with distinct backgrounds; the first two move into history.
+        .{ .output = "\x1b[41m \x1b[0m\r\n\x1b[42m \x1b[0m\r\n\x1b[43m \x1b[0m\r\n\x1b[44m \x1b[0m\r\n\x1b[45m \x1b[0m" },
+        .{ .scroll = .{ .delta = -1 } },
+        .{ .scroll = .top },
+        // Output while scrolled back leaves the visible history in place.
+        .{ .output = "\r\n\x1b[46m \x1b[0m" },
+        .{ .scroll = .{ .delta = 1 } },
+        .{ .scroll = .bottom },
+    };
+    for (steps) |step| {
+        switch (step) {
+            .output => |bytes| stream.nextSlice(bytes),
+            .scroll => |scroll| term.scrollViewport(scroll),
+        }
+        const changed = try renderer.drawTerminal(&font, &term);
+        reference.damage.invalidate();
+        _ = try reference.drawTerminal(&font, &term);
+        try std.testing.expectEqualSlices(u32, &expected, &pixels[renderer.render_index]);
+        if (changed) renderer.completeFlip();
+    }
+    const screen = term.screens.active;
+    try std.testing.expectEqual(@as(?u16, 2), cursorRow(screen));
+
+    term.scrollViewport(.top);
+    try std.testing.expectEqual(@as(?u16, null), cursorRow(screen));
+    try std.testing.expect(try renderer.drawTerminal(&font, &term));
+    const frame = pixels[renderer.render_index];
+    try std.testing.expectEqualSlices(u32, &.{ 0xCD0000, 0x00CD00, 0xCDCD00 }, &.{ frame[0], frame[3], frame[6] });
+    renderer.completeFlip();
+
+    // Scrolling up one row pushes the cursor's bottom row out of view.
+    term.scrollViewport(.bottom);
+    term.scrollViewport(.{ .delta = -1 });
+    try std.testing.expectEqual(@as(?u16, null), cursorRow(screen));
+    term.scrollViewport(.{ .delta = 1 });
+    try std.testing.expectEqual(@as(?u16, 2), cursorRow(screen));
 }
 
 test "pending flips retain source damage and wide cursor moves erase the old row" {

@@ -106,7 +106,13 @@ pub fn main(init: std.process.Init) !void {
     const cols: u16 = @intCast(renderer.mode.hdisplay / font.cell_width);
     const rows: u16 = @intCast(renderer.mode.vdisplay / font.cell_height);
     if (cols == 0 or rows == 0) return error.DisplayTooSmall;
-    var term = try ghosttyvt.Terminal.init(io, gpa, .{ .cols = cols, .rows = rows });
+    var term = try ghosttyvt.Terminal.init(io, gpa, .{
+        .cols = cols,
+        .rows = rows,
+        // Limit history by lines; a zero byte limit is what disables it.
+        .max_scrollback_bytes = if (config.scrollback_lines == 0) 0 else null,
+        .max_scrollback_lines = config.scrollback_lines,
+    });
     defer term.deinit(gpa);
     try Colors.configure(&term, gpa);
     term.width_px = renderer.mode.hdisplay;
@@ -185,10 +191,27 @@ pub fn main(init: std.process.Init) !void {
 
         if (!pty_closed) {
             input.keyboard.application_cursor = term.modes.get(.cursor_keys);
+            input.keyboard.scrollback = term.screens.active_key == .primary and config.scrollback_lines != 0;
             const now = std.Io.Clock.awake.now(io).toNanoseconds();
             while (try input.next(now, &keys)) |event| switch (event) {
-                .bytes => |bytes| try pty.queue(bytes),
+                .bytes => |bytes| {
+                    // Typing returns to the live screen; new output does not.
+                    if (!term.screens.active.viewportIsBottom()) {
+                        term.scrollViewport(.bottom);
+                        pacing.dirty = true;
+                    }
+                    try pty.queue(bytes);
+                },
                 .switch_vt => |number| if (vt) |*v| v.activate(number),
+                .scroll => |scroll| {
+                    term.scrollViewport(switch (scroll) {
+                        .page_up => .{ .delta = -@as(isize, rows) },
+                        .page_down => .{ .delta = rows },
+                        .top => .top,
+                        .bottom => .bottom,
+                    });
+                    pacing.dirty = true;
+                },
             };
             try pty.flush();
         }
