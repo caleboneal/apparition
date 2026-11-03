@@ -32,6 +32,24 @@ const Session = struct {
             self.write_error = err;
         };
     }
+
+    // libghostty-vt does not re-export its device attribute types.
+    const DeviceAttributes = @typeInfo(@typeInfo(@typeInfo(
+        @FieldType(ghosttyvt.TerminalStream.Handler.Effects, "device_attributes"),
+    ).optional.child).pointer.child).@"fn".return_type.?;
+
+    // Without a callback, CSI c queries go unanswered. Programs such as
+    // Helix block at startup until their DA1 query is answered.
+    fn deviceAttributes(_: *ghosttyvt.TerminalStream.Handler) DeviceAttributes {
+        return .{};
+    }
+
+    fn init(pty: *Pty, stream: ghosttyvt.TerminalStream) Session {
+        var session = Session{ .pty = pty, .stream = stream };
+        session.stream.handler.effects.write_pty = &writePty;
+        session.stream.handler.effects.device_attributes = &deviceAttributes;
+        return session;
+    }
 };
 
 const FramePacer = struct {
@@ -98,11 +116,7 @@ pub fn main(init: std.process.Init) !void {
     const shell_path: [*:0]const u8 = if (shell != null and shell[0] != 0) @ptrCast(shell) else "/bin/sh";
     var pty = try Pty.init(gpa, shell_path, rows, cols);
     defer pty.deinit();
-    var session = Session{
-        .pty = &pty,
-        .stream = .init(.{ .allocator = gpa, .handler = .init(&term) }),
-    };
-    session.stream.handler.effects.write_pty = &Session.writePty;
+    var session = Session.init(&pty, .init(.{ .allocator = gpa, .handler = .init(&term) }));
     defer session.stream.deinit();
 
     // When launched from a Linux VT, libinput owns keyboard input while we
@@ -230,19 +244,15 @@ test "terminal stream parses split output and queues cursor reports" {
     defer term.deinit(std.testing.allocator);
     var pty = Pty{ .fd = -1, .pid = -1, .allocator = std.testing.allocator };
     defer pty.pending.deinit(std.testing.allocator);
-    var session = Session{
-        .pty = &pty,
-        .stream = .init(.{ .allocator = std.testing.allocator, .handler = .init(&term) }),
-    };
+    var session = Session.init(&pty, .init(.{ .allocator = std.testing.allocator, .handler = .init(&term) }));
     defer session.stream.deinit();
-    session.stream.handler.effects.write_pty = &Session.writePty;
     session.stream.nextSlice("hello\r\n\x1b[3");
-    session.stream.nextSlice("1mred\x1b[0m\x1b[6n");
+    session.stream.nextSlice("1mred\x1b[0m\x1b[6n\x1b[c");
     try std.testing.expect(!session.stream.handler.semantic_failure);
     try std.testing.expect(session.write_error == null);
     try std.testing.expectEqual(@as(u16, 3), term.screens.active.cursor.x);
     try std.testing.expectEqual(@as(u16, 1), term.screens.active.cursor.y);
-    try std.testing.expectEqualStrings("\x1b[2;4R", pty.pending.items);
+    try std.testing.expectEqualStrings("\x1b[2;4R\x1b[?62;22c", pty.pending.items);
     const pin = term.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?;
     try std.testing.expectEqual(@as(u21, 'r'), pin.rowAndCell().cell.codepoint());
 }
