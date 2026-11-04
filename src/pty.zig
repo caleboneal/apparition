@@ -26,7 +26,11 @@ pidfd: c_int = -1,
 reaped: bool = false,
 pending: std.ArrayList(u8) = .empty,
 written: usize = 0,
+/// Whether input was dropped since the queue last drained, to warn once.
+overflowed: bool = false,
 allocator: std.mem.Allocator,
+
+const max_pending = 1024 * 1024;
 
 /// Window size reported through TIOCGWINSZ. Image tools size their output
 /// from the pixel dimensions, so report the cell grid's area, not the display's.
@@ -131,7 +135,9 @@ pub fn read(self: *Self, buffer: []u8) !?usize {
     }
 }
 
-pub fn queue(self: *Self, bytes: []const u8) !void {
+/// Queue input for the shell. When a program stops reading, input beyond
+/// the queue's limit is dropped rather than buffered without bound.
+pub fn queue(self: *Self, bytes: []const u8) error{OutOfMemory}!void {
     // Compact only before appending, keeping partially written input intact.
     if (self.written > 0) {
         const remaining = self.pending.items.len - self.written;
@@ -139,7 +145,11 @@ pub fn queue(self: *Self, bytes: []const u8) !void {
         self.pending.items.len = remaining;
         self.written = 0;
     }
-    if (bytes.len > 1024 * 1024 - self.pending.items.len) return error.PtyInputQueueFull;
+    if (bytes.len > max_pending - self.pending.items.len) {
+        if (!self.overflowed) std.log.warn("PTY input queue is full; dropping input until the program reads", .{});
+        self.overflowed = true;
+        return;
+    }
     try self.pending.appendSlice(self.allocator, bytes);
 }
 
@@ -164,6 +174,7 @@ pub fn flush(self: *Self) !void {
     }
     self.pending.clearRetainingCapacity();
     self.written = 0;
+    self.overflowed = false;
 }
 
 pub fn errno() c_int {
@@ -222,4 +233,19 @@ test "PTY preserves queued bytes across a partial write" {
     try pty.queue("def");
     try std.testing.expectEqualStrings("cdef", pty.pending.items);
     try std.testing.expectEqual(@as(usize, 0), pty.written);
+}
+
+test "PTY drops input that would overflow its queue instead of failing" {
+    var pty = Self{ .fd = -1, .pid = -1, .allocator = std.testing.allocator };
+    defer pty.pending.deinit(std.testing.allocator);
+    const previous_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = previous_log_level;
+    try pty.pending.appendNTimes(std.testing.allocator, 'x', max_pending - 2);
+    try pty.queue("abc");
+    try std.testing.expect(pty.overflowed);
+    try std.testing.expectEqual(max_pending - 2, pty.pending.items.len);
+    // Input that still fits is queued, so short replies are not lost forever.
+    try pty.queue("ab");
+    try std.testing.expectEqual(max_pending, pty.pending.items.len);
 }

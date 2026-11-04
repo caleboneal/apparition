@@ -59,8 +59,14 @@ pub const Repeat = struct {
 context: *libinput.libinput,
 keyboard: Keyboard,
 repeat: Repeat,
+/// Held keys whose press scrolled or switched VTs, so their releases are
+/// not reported to the application either.
+claimed: std.StaticBitSet(key_count) = .initEmpty(),
 /// Borrowed libinput descriptor; poll for readability, but do not read or close it.
 fd: c_int,
+
+/// Evdev key codes run through KEY_MAX (0x2ff).
+const key_count = 0x300;
 
 /// libinput returns -errno on failure.
 fn openRestricted(path: [*c]const u8, flags: c_int, user_data: ?*anyopaque) callconv(.c) c_int {
@@ -118,9 +124,10 @@ pub fn deinit(self: *Self) void {
 /// releases for held keys, which are applied now so modifiers do not stick.
 pub fn deactivate(self: *Self) !void {
     libinput.libinput_suspend(self.context);
-    var discard: [16]u8 = undefined;
+    var discard: [max_key_bytes]u8 = undefined;
     while (try self.next(0, &discard)) |_| {}
     self.repeat.key = null;
+    self.claimed = .initEmpty();
 }
 
 /// Reopen input devices after returning to this VT.
@@ -137,9 +144,12 @@ pub const Event = union(enum) {
     scroll: Keyboard.Scroll,
 };
 
+/// A buffer this large holds any single key's encoding, including kitty
+/// protocol reports with associated text.
+pub const max_key_bytes = 128;
+
 /// Dispatch and drain events until a key produces bytes or an action, then
 /// emit a due autorepeat, or return null if none. now_ns uses the awake clock.
-/// Five bytes suffice for every supported key.
 /// BufferTooSmall consumes the key event, but still updates its modifier state.
 pub fn next(self: *Self, now_ns: i96, buffer: []u8) !?Event {
     if (libinput.libinput_dispatch(self.context) != 0)
@@ -157,23 +167,42 @@ pub fn next(self: *Self, now_ns: i96, buffer: []u8) !?Event {
         if ((pressed and count != 1) or (!pressed and count != 0)) continue;
 
         const key = libinput.libinput_event_keyboard_get_key(key_event);
-        if (!pressed) self.repeat.release(key);
-        const bytes = try self.keyboard.key(key, pressed, buffer);
-        if (pressed) {
-            if (self.keyboard.switchTarget(key)) |vt| {
-                self.repeat.key = null;
-                return .{ .switch_vt = vt };
+        const claimable = key < key_count;
+        if (!pressed) {
+            self.repeat.release(key);
+            if (self.isClaimed(key)) {
+                self.claimed.unset(key);
+                self.keyboard.update(key, false);
+                continue;
             }
-            if (self.keyboard.repeats(key)) self.repeat.press(key, now_ns);
-            if (self.keyboard.scrollAction(key)) |scroll| return .{ .scroll = scroll };
+            const bytes = self.keyboard.encode(key, .release, buffer);
+            self.keyboard.update(key, false);
+            if (try bytes) |b| return .{ .bytes = b };
+            continue;
         }
-        if (bytes) |b| return .{ .bytes = b };
+        self.keyboard.update(key, true);
+        if (self.keyboard.switchTarget(key)) |vt| {
+            self.repeat.key = null;
+            if (claimable) self.claimed.set(key);
+            return .{ .switch_vt = vt };
+        }
+        if (self.keyboard.repeats(key)) self.repeat.press(key, now_ns);
+        if (self.keyboard.scrollAction(key)) |scroll| {
+            if (claimable) self.claimed.set(key);
+            return .{ .scroll = scroll };
+        }
+        if (try self.keyboard.encode(key, .press, buffer)) |b| return .{ .bytes = b };
     }
     if (self.repeat.due(now_ns)) |key| {
         if (self.keyboard.scrollAction(key)) |scroll| return .{ .scroll = scroll };
-        if (try self.keyboard.repeat(key, buffer)) |bytes| return .{ .bytes = bytes };
+        if (self.isClaimed(key)) return null;
+        if (try self.keyboard.encode(key, .repeat, buffer)) |bytes| return .{ .bytes = bytes };
     }
     return null;
+}
+
+fn isClaimed(self: *const Self, key: u32) bool {
+    return key < key_count and self.claimed.isSet(key);
 }
 
 test "repeat waits for the delay, then follows the rate without bursting" {

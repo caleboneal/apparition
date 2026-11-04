@@ -10,6 +10,7 @@ const Seat = @import("seat.zig");
 const Colors = @import("colors.zig");
 const Images = @import("renderer/images.zig");
 const Box = @import("renderer/box.zig");
+const Blocks = @import("renderer/blocks.zig");
 const Powerline = @import("renderer/powerline.zig");
 
 const Self = @This();
@@ -128,6 +129,9 @@ pub const Font = struct {
 
     underline_position: u32 = 0,
     underline_thickness: u32 = 1,
+    /// Top of the strikethrough, in pixels below the cell's top.
+    strikethrough_position: u32 = 0,
+    strikethrough_thickness: u32 = 1,
 
     pub const Options = struct {
         /// Null uses the embedded JetBrains Mono family.
@@ -181,6 +185,16 @@ pub const Font = struct {
         const height = @max(1, @max(@divFloor(metrics.height + 63, 64), ascender - @divFloor(metrics.descender, 64)));
         // Coordinates below use signed pixel offsets, including glyph bearings.
         if (width > std.math.maxInt(i32) or height > std.math.maxInt(i32)) return error.InvalidFontMetrics;
+        const underline_thickness = std.math.clamp(@divFloor(freetype.FT_MulFix(face.*.underline_thickness, metrics.y_scale) + 63, 64), 1, height);
+        // The OS/2 table gives the stroke's top above the baseline; without
+        // one, center a stroke near the middle of lowercase letters.
+        var strike_thickness = underline_thickness;
+        var strike_top = @divFloor(ascender * 3, 10) + @divFloor(strike_thickness + 1, 2);
+        const os2: ?*const freetype.TT_OS2 = @ptrCast(@alignCast(freetype.FT_Get_Sfnt_Table(face, freetype.FT_SFNT_OS2)));
+        if (os2) |table| if (table.yStrikeoutSize > 0) {
+            strike_thickness = std.math.clamp(@divFloor(freetype.FT_MulFix(table.yStrikeoutSize, metrics.y_scale) + 63, 64), 1, height);
+            strike_top = @divFloor(freetype.FT_MulFix(table.yStrikeoutPosition, metrics.y_scale) + 32, 64);
+        };
         return .{
             .allocator = allocator,
             .library = library,
@@ -189,7 +203,9 @@ pub const Font = struct {
             .cell_height = @intCast(height),
             .ascender = @intCast(ascender),
             .underline_position = @intCast(std.math.clamp(ascender - @divFloor(freetype.FT_MulFix(face.*.underline_position, metrics.y_scale), 64), 0, height - 1)),
-            .underline_thickness = @intCast(std.math.clamp(@divFloor(freetype.FT_MulFix(face.*.underline_thickness, metrics.y_scale) + 63, 64), 1, height)),
+            .underline_thickness = @intCast(underline_thickness),
+            .strikethrough_position = @intCast(std.math.clamp(ascender - strike_top, 0, height - 1)),
+            .strikethrough_thickness = @intCast(strike_thickness),
         };
     }
 
@@ -211,6 +227,8 @@ pub const Font = struct {
         const width = self.cell_width * cells;
         const drawn = if (Box.covers(codepoint))
             try Box.draw(self.allocator, codepoint, width, self.cell_height, self.underline_thickness)
+        else if (Blocks.covers(codepoint))
+            try Blocks.draw(self.allocator, codepoint, width, self.cell_height)
         else if (Powerline.covers(codepoint))
             try Powerline.draw(self.allocator, codepoint, width, self.cell_height, self.underline_thickness)
         else
@@ -578,6 +596,19 @@ const Canvas = struct {
         }
     }
 
+    /// Draw the underline, strikethrough, and overline that style requests.
+    fn drawDecorations(self: Canvas, font: *const Font, style: ghosttyvt.Style, rect: Rect, color: u32, underline_color: u32) void {
+        self.drawUnderline(font, style, rect, underline_color);
+        if (rect.height == 0) return;
+        if (style.flags.strikethrough) {
+            const thickness = @min(font.strikethrough_thickness, rect.height);
+            const offset = @min(font.strikethrough_position, rect.height - thickness);
+            self.fillRect(color, .{ .x = rect.x, .y = rect.y + offset, .width = rect.width, .height = thickness });
+        }
+        if (style.flags.overline)
+            self.fillRect(color, .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = @min(font.underline_thickness, rect.height) });
+    }
+
     fn drawUnderline(self: Canvas, font: *const Font, style: ghosttyvt.Style, rect: Rect, color: u32) void {
         if (style.flags.underline == .none or rect.height == 0) return;
         const thickness = @min(font.underline_thickness, rect.height);
@@ -850,7 +881,8 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
             if (cell.wide == .spacer_head or cell.wide == .spacer_tail) continue;
             const style = pin.style(cell);
             const glyphless = cell.codepoint() == 0 or (cell.codepoint() == ' ' and !cell.hasGrapheme());
-            if (style.flags.invisible or (glyphless and style.flags.underline == .none)) continue;
+            const undecorated = style.flags.underline == .none and !style.flags.strikethrough and !style.flags.overline;
+            if (style.flags.invisible or (glyphless and undecorated)) continue;
             const colors = cellColors(cell.*, style, theme);
             const rect: Rect = .{
                 .x = @intCast(x),
@@ -860,7 +892,7 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
             };
             try self.drawCell(font, pin, cell, FontStyle.fromCell(style), rect, colors.fg);
             const underline_color = if (style.underlineColor(theme.palette)) |rgb| rgbPixel(rgb) else colors.fg;
-            canvas.drawUnderline(font, style, rect, underline_color);
+            canvas.drawDecorations(font, style, rect, colors.fg, underline_color);
         }
         self.drawImages(.above_text, strip);
     }
@@ -940,7 +972,7 @@ fn drawCursor(self: *Self, font: *Font, term: *ghosttyvt.Terminal, row: u16) !vo
             canvas.fillRect(cursor_color, rect);
             if (!style.flags.invisible) {
                 try self.drawCell(font, cursor_pin, cell, FontStyle.fromCell(style), rect, colors.bg);
-                canvas.drawUnderline(font, style, rect, colors.bg);
+                canvas.drawDecorations(font, style, rect, colors.bg, colors.bg);
             }
         },
         .bar => canvas.fillRect(cursor_color, .{ .x = rect.x, .y = rect.y, .width = @min(2, rect.width), .height = rect.height }),
@@ -1132,6 +1164,10 @@ test "bundled font faces load and cache each style independently" {
     try std.testing.expect(font.cell_width > 0 and font.cell_height > 0);
     try std.testing.expect(font.underline_position < font.cell_height);
     try std.testing.expect(font.underline_thickness > 0);
+    // The strikethrough crosses lowercase letters: below the cap height and
+    // above the baseline.
+    try std.testing.expect(font.strikethrough_position > @as(u32, @intCast(font.ascender)) / 3);
+    try std.testing.expect(font.strikethrough_position + font.strikethrough_thickness <= @as(u32, @intCast(font.ascender)));
     const styles = [_]FontStyle{ .regular, .bold, .italic, .bold_italic };
     for (styles) |style| {
         const flags = font.faces[@intFromEnum(style)].*.style_flags;
@@ -1411,6 +1447,32 @@ test "underlines cover spaces and wide cells with colors, resets and invisibilit
     try std.testing.expectEqual(@as(u32, 0xabcdef), pixels[30]);
 }
 
+test "strikethrough and overline cover spaces in the text color" {
+    const allocator = std.testing.allocator;
+    var font = testFont();
+    font.cell_width = 2;
+    font.cell_height = 4;
+    font.underline_position = 3;
+    font.strikethrough_position = 2;
+    defer font.deinit();
+    var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 1 });
+    defer term.deinit(allocator);
+    try Colors.configure(&term, allocator);
+    var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?25l\x1b[9;31m \x1b[29;53m \x1b[55;4;58;2;18;52;86m ");
+    var pixels = [_]u32{99} ** 24;
+    var renderer = try testRenderer(&pixels, 6, 4, 6);
+    defer renderer.deinitDrawing();
+    _ = try renderer.drawTerminal(&font, &term);
+    const red = rgbPixel(Colors.palette[1]);
+    const bg = rgbPixel(Colors.background);
+    try std.testing.expectEqualSlices(u32, &.{ bg, bg, red, red, bg, bg }, pixels[0..6]);
+    try std.testing.expectEqualSlices(u32, &([_]u32{bg} ** 6), pixels[6..12]);
+    try std.testing.expectEqualSlices(u32, &.{ red, red, bg, bg, bg, bg }, pixels[12..18]);
+    try std.testing.expectEqualSlices(u32, &.{ bg, bg, bg, bg, 0x123456, 0x123456 }, pixels[18..24]);
+}
+
 test "grapheme clusters choose faces by presentation and compose combining marks" {
     const allocator = std.testing.allocator;
     var font = try Font.init(allocator, .{ .pixel_size = 16 });
@@ -1553,6 +1615,16 @@ test "powerline separators ignore the font's glyphs and fill the font's cell" {
         try std.testing.expectEqual(font.ascender, glyph.top);
         for (1..glyph.rows - 1) |row| try std.testing.expectEqual(@as(u8, 255), glyph.pixels[row * glyph.width]);
     }
+}
+
+test "full blocks ignore the font's glyphs and cover the whole cell" {
+    var font = try Font.init(std.testing.allocator, .{ .pixel_size = 16 });
+    defer font.deinit();
+    const glyph = try font.glyph(glyphKey(0x2588, .regular, 1));
+    try std.testing.expectEqual(@as(usize, font.cell_width), glyph.width);
+    try std.testing.expectEqual(@as(usize, font.cell_height), glyph.rows);
+    try std.testing.expectEqual(font.ascender, glyph.top);
+    try std.testing.expect(std.mem.allEqual(u8, glyph.pixels, 255));
 }
 
 fn testFont() Font {

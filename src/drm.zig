@@ -91,7 +91,7 @@ fn openCandidate(seat: *Seat, path: [*:0]const u8) !Device {
 
     const selection = try selectDisplay(fd, resources);
     log.info("Selected {s}: connector {d}, encoder {d}, CRTC {d}, {d}x{d}", .{
-        path,              selection.connector_id,   selection.encoder_id,
+        path,              selection.connector_id,  selection.encoder_id,
         selection.crtc_id, selection.mode.hdisplay, selection.mode.vdisplay,
     });
     return .{

@@ -3,7 +3,7 @@
 Apparition is a KMS / DRM terminal emulator built on `libghostty-vt`.
 
 It starts an interactive `$SHELL` (falling back to `/bin/sh`) on a PTY with
-`TERM=xterm-256color`. Shell output is parsed by `libghostty-vt` and rendered
+`TERM=xterm-256color` and `COLORTERM=truecolor`. Shell output is parsed by `libghostty-vt` and rendered
 as a fixed-cell grid with colors and a cursor. The terminal's rows and columns
 are derived from the display resolution and font metrics and passed to the PTY.
 
@@ -26,13 +26,22 @@ compatible display route and the output's preferred mode, and logs the selected
 card, connector, and CRTC. JetBrains Mono and Noto Color Emoji are bundled, so
 no system font installation is needed. See [Fonts](#fonts) for configuration.
 
-Keyboards are discovered through libinput/udev. Input supports UTF-8, Shift,
-Ctrl combinations such as Ctrl-C/Ctrl-D, Alt, Enter, Backspace, Tab, Escape,
-and navigation keys, including application-cursor mode. XKB uses the default
-layout, configurable through `XKB_DEFAULT_*` environment variables. Held keys
-autorepeat after `repeat_delay_ms` (600 ms) at `repeat_rate` (25 per second),
-both set in `src/config.zig`; a rate of 0 disables autorepeat. Modifiers do
-not repeat, and repeats use the current modifiers.
+Keyboards are discovered through libinput/udev. Keys are encoded by
+`libghostty-vt`'s key encoder, the same one Ghostty uses: UTF-8 text, Ctrl
+and Alt combinations, function keys F1 through F24, Insert, navigation and
+keypad keys, and xterm modifier sequences such as `ESC [1;5D` for Ctrl+Left.
+Application cursor and keypad modes, DECBKM (Backspace sends `^H`),
+modifyOtherKeys, and the kitty keyboard protocol (including repeat and release
+reports) follow the terminal's modes. Outside the kitty protocol, Ctrl+[,
+Ctrl+I, and Ctrl+M send ESC, Tab, and CR as on the Linux console. Ctrl
+shortcuts use the key's US position on non-Latin layouts, so Ctrl+C works
+with a Russian layout. XKB uses the default layout, configurable through
+`XKB_DEFAULT_*` environment variables. Held keys autorepeat after
+`repeat_delay_ms` (600 ms) at `repeat_rate` (25 per second), both set in
+`src/config.zig`; a rate of 0 disables autorepeat. Modifiers do not repeat,
+and repeats use the current modifiers. If a program stops reading its input,
+keys and terminal replies beyond 1 MiB of queued input are dropped with a
+warning rather than ending the session.
 
 Shift+PageUp and Shift+PageDown scroll through history a page at a time, and
 Shift+Home and Shift+End jump to the oldest line or back to the live screen.
@@ -67,7 +76,8 @@ the shell. The event loop polls PTY, input, shell exit (through a pidfd, so
 Linux 5.3 or later is required), and pending DRM page-flip events instead of
 busy-spinning or blocking on vblank, and an idle terminal sleeps without a
 timeout. Output updates are coalesced at the display refresh rate (60 Hz if
-the mode does not report one).
+the mode does not report one). While a program holds synchronized output
+(mode 2026), frames wait until it finishes its update, or one second at most.
 
 Rendering caches glyphs by codepoint, font style, and cell width at the
 configured font size and repaints only damaged rows, including the old and
@@ -101,6 +111,10 @@ thickness; heavy lines are twice that, and double lines are spaced by it. This
 covers light, heavy, and double lines with their mixed junctions, dashed
 lines, rounded corners, and diagonals.
 
+Block elements (U+2580 to U+259F) are drawn the same way: halves, eighths,
+and quadrants cover exact fractions of the cell so they tile seamlessly, and
+the light, medium, and dark shades blend the foreground over the background.
+
 Powerline separators (U+E0B0 to U+E0BF) are drawn the same way, so prompts
 such as starship's render with any font, without a Nerd Font, and their solid
 shapes meet neighboring cell backgrounds without gaps. This covers the solid
@@ -112,7 +126,8 @@ clipboard, IME/compose, fallback beyond the emoji font, or display hotplug/
 resize handling. Bold,
 italic, and bold-italic text use separate font faces. Underlines support single,
 double, curly, dotted, and dashed styles, including spaces, wide cells, and
-SGR 58/59 underline colors. Colors use the xterm ANSI palette and standard
+SGR 58/59 underline colors. Strikethrough (SGR 9) and overline (SGR 53) are
+drawn in the text color. Colors use the xterm ANSI palette and standard
 256-color cube/grayscale ramp, with bold-as-bright ANSI foregrounds, faint
 text, inverse video, and truecolor support. Application OSC
 color changes and resets are honored. The default background, which also fills
@@ -138,7 +153,8 @@ The directory must contain `MyMono-Regular.ttf`, `MyMono-Bold.ttf`,
 `MyMono-Italic.ttf`, and `MyMono-BoldItalic.ttf`. All four faces are required;
 startup reports the path if one cannot be loaded. Set `font_directory` to
 `null` to use bundled JetBrains Mono (`font_name` is ignored in that case).
-Underline position and thickness come from the regular font's metrics.
+Underline and strikethrough position and thickness come from the regular
+font's metrics.
 
 Try the styles in the terminal with:
 
@@ -172,7 +188,8 @@ zig build test
 Tests cover PTY shell startup and sizing (including pixel size), exec
 failure, queued input, libpng decoding and kitty PNG transmissions, kitty image
 layering, scaling, and incremental redraws,
-terminal parsing/replies, keyboard translation and autorepeat timing, VT
+terminal parsing/replies, legacy and kitty key encoding, terminal key modes,
+non-Latin layouts, autorepeat timing, synchronized output timeouts, VT
 switch keys and seat enable/disable ordering, DRM routing helpers, and
 incremental rendering without requiring DRM or input hardware. Renderer tests
 compare dirty-row frames against full redraws through buffer flips, cursor
@@ -185,6 +202,8 @@ placement, color glyph copying, resampling, and blending, and render skin-tone,
 ZWJ, flag, keycap, and VS16 sequences as single color glyphs within their
 cells. Box drawing tests check exact pixels for lines, junctions, nested double
 corners, dashes, and arcs, that every character reaches the cell edges its
-lines point to, and that boxes join across neighboring cells. Powerline tests
+lines point to, and that boxes join across neighboring cells. Block element
+tests check exact fractions, that complementary halves and quadrants tile the
+cell, and shade densities. Powerline tests
 check that left and right separators mirror each other, solid shapes cover
 their flat edge, and separators bypass the font.
