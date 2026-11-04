@@ -36,6 +36,14 @@ pub fn build(b: *std.Build) void {
     });
     addPkgConfigIncludes(b, freetype, "freetype2");
 
+    const harfbuzz = b.addTranslateC(.{
+        .root_source_file = b.path("src/c/harfbuzz.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addPkgConfigIncludes(b, harfbuzz, "harfbuzz");
+    addPkgConfigIncludes(b, harfbuzz, "freetype2");
+
     const libpng = b.addTranslateC(.{
         .root_source_file = b.path("src/c/libpng.h"),
         .target = target,
@@ -57,6 +65,7 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.linkSystemLibrary("gbm", .{});
     exe.root_module.linkSystemLibrary("freetype2", .{});
+    exe.root_module.linkSystemLibrary("harfbuzz", .{ .use_pkg_config = .force });
     exe.root_module.linkSystemLibrary("input", .{});
     exe.root_module.linkSystemLibrary("libudev", .{ .use_pkg_config = .force });
     exe.root_module.linkSystemLibrary("libseat", .{ .use_pkg_config = .force });
@@ -69,10 +78,12 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("libseat", libseat.createModule());
     exe.root_module.addImport("libdrm", libdrm.createModule());
     exe.root_module.addImport("freetype", freetype.createModule());
+    exe.root_module.addImport("harfbuzz", harfbuzz.createModule());
     exe.root_module.addImport("libpng", libpng.createModule());
 
     b.installArtifact(exe);
     b.installFile("src/fonts/OFL.txt", "share/licenses/apparition/JetBrainsMono-OFL.txt");
+    b.installFile("src/fonts/NotoColorEmoji-OFL.txt", "share/licenses/apparition/NotoColorEmoji-OFL.txt");
 
     const tests = b.addTest(.{ .root_module = exe.root_module });
     const run_tests = b.addRunArtifact(tests);

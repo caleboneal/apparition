@@ -26,6 +26,7 @@
               pkgs.libdrm
               pkgs.libgbm
               pkgs.freetype
+              pkgs.harfbuzz
               pkgs.libpng
               pkgs.libinput
               pkgs.seatd

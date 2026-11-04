@@ -130,6 +130,7 @@ pub fn main(init: std.process.Init) !void {
         .max_scrollback_bytes = if (config.scrollback_lines == 0) 0 else null,
         .max_scrollback_lines = config.scrollback_lines,
         .kitty_image_storage_limit = config.image_storage_limit,
+        .default_modes = .{ .grapheme_cluster = config.grapheme_clustering },
     });
     defer term.deinit(gpa);
     try Colors.configure(&term, gpa);

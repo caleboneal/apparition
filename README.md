@@ -23,8 +23,8 @@ server already holds DRM master. Apparition discovers
 DRM cards and selects one with dumb-buffer support and a connected, routable
 output, skipping inaccessible or unsuitable cards. It prefers an existing
 compatible display route and the output's preferred mode, and logs the selected
-card, connector, and CRTC. JetBrains Mono is bundled, so no system font
-installation is needed. See [Fonts](#fonts) for configuration.
+card, connector, and CRTC. JetBrains Mono and Noto Color Emoji are bundled, so
+no system font installation is needed. See [Fonts](#fonts) for configuration.
 
 Keyboards are discovered through libinput/udev. Input supports UTF-8, Shift,
 Ctrl combinations such as Ctrl-C/Ctrl-D, Alt, Enter, Backspace, Tab, Escape,
@@ -67,16 +67,32 @@ the shell. The event loop polls PTY, input, and pending DRM page-flip events
 instead of busy-spinning or blocking on vblank. Output updates are coalesced
 at the display refresh rate (60 Hz if the mode does not report one).
 
-Rendering caches glyph masks by codepoint and font style at the configured
-font size and repaints only damaged rows. Damage accumulates independently for
-both framebuffers, including
+Rendering caches glyphs by codepoint, font style, and cell width at the
+configured font size and repaints only damaged rows. Damage accumulates
+independently for both framebuffers, including
 the old and new cursor rows. Screen, palette, default-color, and grid changes
 trigger full redraws (including display margins). Once the back buffer is
 current, nonvisual output does not cause another page flip.
 
+Grapheme clustering (mode 2027) is on by default, so emoji ZWJ sequences,
+flags, skin tones, keycaps, and combining marks each occupy one cell (wide for
+emoji). Set `grapheme_clustering` in `src/config.zig` to `false` for legacy
+per-codepoint widths; programs can also toggle the mode. Cells holding more
+than one codepoint are shaped once with HarfBuzz and cached, so combining
+marks compose or stack on their base and emoji sequences become a single
+glyph. Marks the font lacks are omitted, and an emoji sequence the emoji font
+does not know shows its first emoji. Text is not shaped across cells, so there
+are no programming ligatures.
+
+A cell uses the emoji font when its codepoint requests emoji presentation:
+with VS16, a ZWJ, a skin tone, a keycap, or a tag sequence; when the terminal
+made it wide; or when the text font lacks it. VS15 asks for the text font.
+Color emoji keep their colors (including under a block cursor) and are scaled
+to fit their cells, centered.
+
 This is still rudimentary: no mouse input,
-clipboard, IME/compose, font fallback, grapheme shaping, or display hotplug/
-resize handling. Rendering uses the first codepoint of each grapheme. Bold,
+clipboard, IME/compose, fallback beyond the emoji font, or display hotplug/
+resize handling. Bold,
 italic, and bold-italic text use separate font faces. Underlines support single,
 double, curly, dotted, and dashed styles, including spaces, wide cells, and
 SGR 58/59 underline colors. Colors use the xterm ANSI palette and standard
@@ -111,11 +127,22 @@ Try the styles in the terminal with:
 printf '\033[1mBold\033[0m  \033[3mItalic\033[0m  \033[1;3mBold italic\033[0m  \033[4mUnderline\033[0m\n'
 ```
 
-JetBrains Mono is distributed under the SIL Open Font License 1.1; see
-`src/fonts/OFL.txt`. The build installs a copy of the license to
-`zig-out/share/licenses/apparition/JetBrainsMono-OFL.txt`; include it when
-redistributing the executable. The font files are from the official
-[JetBrains Mono v2.304 release](https://github.com/JetBrains/JetBrainsMono/tree/v2.304).
+Noto Color Emoji 2.057 (Unicode 18) is embedded for emoji with any text
+family. It is a color bitmap font with a single 109 ppem strike, so emoji are
+downscaled to the cell grid with area averaging. Try it with:
+
+```sh
+printf '👍🏽 👨‍👩‍👧 🇺🇸 1️⃣ ❤️ ⚡ ⚡︎ e\u0301\n'
+```
+
+JetBrains Mono and Noto Color Emoji are distributed under the SIL Open Font
+License 1.1; see `src/fonts/OFL.txt` and `src/fonts/NotoColorEmoji-OFL.txt`.
+The build installs copies of both licenses to
+`zig-out/share/licenses/apparition/`; include them when redistributing the
+executable. The font files are from the official
+[JetBrains Mono v2.304 release](https://github.com/JetBrains/JetBrainsMono/tree/v2.304)
+and the
+[Noto Emoji v2026-09-24-unicode18_0 release](https://github.com/googlefonts/noto-emoji/tree/v2026-09-24-unicode18_0/2D/fonts).
 
 ## Tests
 
@@ -133,4 +160,8 @@ compare dirty-row frames against full redraws through buffer flips, cursor
 changes, scrolling, scrollback viewports, screen switches, color changes, and
 drawing-error retries.
 Font tests load bundled and external families, verify independent style caches,
-and cover styled block cursors and underlines on spaces and wide cells.
+and cover styled block cursors and underlines on spaces and wide cells. Emoji
+and grapheme tests cover presentation selection, combining mark composition and
+placement, color glyph copying, resampling, and blending, and render skin-tone,
+ZWJ, flag, keycap, and VS16 sequences as single color glyphs within their
+cells.

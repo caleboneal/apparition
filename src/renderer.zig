@@ -3,6 +3,7 @@ const linux = std.os.linux;
 
 const libdrm = @import("libdrm");
 const freetype = @import("freetype");
+const harfbuzz = @import("harfbuzz");
 const ghosttyvt = @import("ghostty-vt");
 const Drm = @import("drm.zig");
 const Seat = @import("seat.zig");
@@ -12,30 +13,69 @@ const Images = @import("renderer/images.zig");
 const Self = @This();
 
 const Glyph = struct {
-    alpha: []u8,
+    /// One coverage byte per pixel, or premultiplied BGRA when `color`.
+    pixels: []u8,
+    color: bool = false,
     width: usize,
     rows: usize,
     left: i32,
     top: i32,
 
     fn copy(allocator: std.mem.Allocator, bitmap: freetype.FT_Bitmap, left: i32, top: i32) !Glyph {
-        if (bitmap.pixel_mode != freetype.FT_PIXEL_MODE_GRAY and bitmap.pixel_mode != freetype.FT_PIXEL_MODE_MONO)
-            return error.UnsupportedGlyphPixelMode;
-        const alpha = try allocator.alloc(u8, @as(usize, bitmap.width) * bitmap.rows);
+        const color = switch (bitmap.pixel_mode) {
+            freetype.FT_PIXEL_MODE_GRAY, freetype.FT_PIXEL_MODE_MONO => false,
+            freetype.FT_PIXEL_MODE_BGRA => true,
+            else => return error.UnsupportedGlyphPixelMode,
+        };
+        const row_bytes = @as(usize, bitmap.width) * @as(usize, if (color) 4 else 1);
+        const pixels = try allocator.alloc(u8, row_bytes * bitmap.rows);
         for (0..bitmap.rows) |row| {
             // FreeType pitch is signed and may include padding between rows.
             const address = @as(i128, @intCast(@intFromPtr(bitmap.buffer))) + @as(i128, @intCast(row)) * bitmap.pitch;
             const source: [*]const u8 = @ptrFromInt(@as(usize, @intCast(address)));
-            const dest = alpha[row * bitmap.width ..][0..bitmap.width];
-            if (bitmap.pixel_mode == freetype.FT_PIXEL_MODE_GRAY) {
-                @memcpy(dest, source[0..bitmap.width]);
-            } else {
+            const dest = pixels[row * row_bytes ..][0..row_bytes];
+            if (bitmap.pixel_mode == freetype.FT_PIXEL_MODE_MONO) {
                 for (dest, 0..) |*value, column| {
                     value.* = if (source[column / 8] & (@as(u8, 0x80) >> @as(u3, @intCast(column % 8))) != 0) 255 else 0;
                 }
+            } else {
+                @memcpy(dest, source[0..row_bytes]);
             }
         }
-        return .{ .alpha = alpha, .width = bitmap.width, .rows = bitmap.rows, .left = left, .top = top };
+        return .{ .pixels = pixels, .color = color, .width = bitmap.width, .rows = bitmap.rows, .left = left, .top = top };
+    }
+
+    /// Area-average onto a width x rows grid. Coverage and premultiplied
+    /// color both average linearly.
+    fn resample(self: Glyph, allocator: std.mem.Allocator, width: usize, rows: usize) !Glyph {
+        const channels: usize = if (self.color) 4 else 1;
+        const pixels = try allocator.alloc(u8, width * rows * channels);
+        const step_x = @as(f32, @floatFromInt(self.width)) / @as(f32, @floatFromInt(width));
+        const step_y = @as(f32, @floatFromInt(self.rows)) / @as(f32, @floatFromInt(rows));
+        for (0..rows) |y| {
+            const y0 = @as(f32, @floatFromInt(y)) * step_y;
+            const y1 = y0 + step_y;
+            for (0..width) |x| {
+                const x0 = @as(f32, @floatFromInt(x)) * step_x;
+                const x1 = x0 + step_x;
+                var sum = [_]f32{0} ** 4;
+                var source_y: usize = @intFromFloat(y0);
+                while (source_y < self.rows and @as(f32, @floatFromInt(source_y)) < y1) : (source_y += 1) {
+                    const top: f32 = @floatFromInt(source_y);
+                    const weight_y = @min(y1, top + 1) - @max(y0, top);
+                    var source_x: usize = @intFromFloat(x0);
+                    while (source_x < self.width and @as(f32, @floatFromInt(source_x)) < x1) : (source_x += 1) {
+                        const left: f32 = @floatFromInt(source_x);
+                        const weight = weight_y * (@min(x1, left + 1) - @max(x0, left));
+                        const source = self.pixels[(source_y * self.width + source_x) * channels ..][0..channels];
+                        for (source, 0..) |value, channel| sum[channel] += weight * @as(f32, @floatFromInt(value));
+                    }
+                }
+                const dest = pixels[(y * width + x) * channels ..][0..channels];
+                for (dest, 0..) |*value, channel| value.* = @intFromFloat(@min(255, @round(sum[channel] / (step_x * step_y))));
+            }
+        }
+        return .{ .pixels = pixels, .color = self.color, .width = width, .rows = rows, .left = self.left, .top = self.top };
     }
 };
 
@@ -51,17 +91,35 @@ const FontStyle = enum(u2) {
     }
 };
 
-fn glyphKey(codepoint: u21, style: FontStyle) u32 {
-    return @as(u32, codepoint) | (@as(u32, @intFromEnum(style)) << 21);
+/// Text faces use FontStyle's indices; the emoji face follows them.
+const emoji_face: u3 = 4;
+
+/// Cache key for a codepoint drawn in a style across one or two cells.
+fn glyphKey(codepoint: u21, style: FontStyle, cells: u2) u64 {
+    return @as(u64, codepoint) | (@as(u64, @intFromEnum(style)) << 32) | (@as(u64, cells) << 36);
 }
 
-/// Owns four FreeType faces and style-aware glyph masks at one fixed size.
+/// Cache key for a shaped glyph index within a face.
+fn indexKey(face: u3, index: u32, cells: u2) u64 {
+    return @as(u64, index) | (@as(u64, face) << 32) | (1 << 35) | (@as(u64, cells) << 36);
+}
+
+/// A shaped glyph, offset in pixels from the cell's origin and baseline.
+const Placed = struct { key: u64, x: i32, y: i32 };
+
+/// Owns the text faces, the emoji face, and glyphs and shaped grapheme
+/// clusters at one fixed size.
 /// Not thread-safe: loading a glyph mutates a face's glyph slot.
 pub const Font = struct {
     allocator: std.mem.Allocator,
-    glyphs: std.AutoHashMapUnmanaged(u32, Glyph) = .empty,
+    glyphs: std.AutoHashMapUnmanaged(u64, Glyph) = .empty,
+    /// Keyed by the bytes of `cluster_key`: style and cells, then codepoints.
+    clusters: std.StringHashMapUnmanaged([]const Placed) = .empty,
+    cluster_key: std.ArrayList(u32) = .empty,
     library: freetype.FT_Library,
-    faces: [4]freetype.FT_Face = .{null} ** 4,
+    faces: [5]freetype.FT_Face = .{null} ** 5,
+    shapers: [5]?*harfbuzz.hb_font_t = .{null} ** 5,
+    buffer: ?*harfbuzz.hb_buffer_t = null,
     cell_width: u32,
     cell_height: u32,
     ascender: i32,
@@ -82,7 +140,7 @@ pub const Font = struct {
         if (freetype.FT_Init_FreeType(&library) != 0) return error.FailedToInitializeFreeType;
         errdefer _ = freetype.FT_Done_FreeType(library);
 
-        var faces: [4]freetype.FT_Face = .{null} ** 4;
+        var faces: [5]freetype.FT_Face = .{null} ** 5;
         errdefer for (faces) |face| {
             if (face != null) _ = freetype.FT_Done_Face(face);
         };
@@ -93,7 +151,7 @@ pub const Font = struct {
             @embedFile("fonts/JetBrainsMono-BoldItalic.ttf"),
         };
         const suffixes = [_][]const u8{ "Regular", "Bold", "Italic", "BoldItalic" };
-        for (&faces, suffixes, bundled) |*face, suffix, data| {
+        for (faces[0..4], suffixes, bundled) |*face, suffix, data| {
             if (options.directory) |directory| {
                 const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}-{s}.ttf", .{ directory, options.name, suffix }, 0);
                 defer allocator.free(path);
@@ -107,6 +165,11 @@ pub const Font = struct {
             }
             if (freetype.FT_Set_Pixel_Sizes(face.*, 0, options.pixel_size) != 0) return error.FailedToSetPixelSizes;
         }
+        const emoji = @embedFile("fonts/NotoColorEmoji.ttf");
+        if (freetype.FT_New_Memory_Face(library, emoji.ptr, emoji.len, 0, &faces[emoji_face]) != 0)
+            return error.FailedToLoadTypeface;
+        // Noto Color Emoji has one bitmap strike; glyphs are scaled to cells.
+        if (freetype.FT_Select_Size(faces[emoji_face], 0) != 0) return error.FailedToSetPixelSizes;
 
         // Keep every style on the regular face's cell grid and baseline.
         const face = faces[0];
@@ -128,23 +191,153 @@ pub const Font = struct {
         };
     }
 
-    fn glyph(self: *Font, codepoint: u21, style: FontStyle) !*const Glyph {
-        const key = glyphKey(codepoint, style);
+    /// Look up a glyphKey or indexKey, rendering it on first use.
+    fn glyph(self: *Font, key: u64) !*const Glyph {
         if (self.glyphs.getPtr(key)) |cached| return cached;
-        const face = self.faces[@intFromEnum(style)];
-        if (freetype.FT_Load_Char(face, codepoint, freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_NORMAL) != 0)
-            return error.GlyphLoadFailed;
-        const slot = face.*.glyph.*;
-        const cached = try Glyph.copy(self.allocator, slot.bitmap, slot.bitmap_left, slot.bitmap_top);
-        errdefer self.allocator.free(cached.alpha);
-        try self.glyphs.put(self.allocator, key, cached);
+        const cells: u2 = @truncate(key >> 36);
+        var face: u3 = @truncate(key >> 32);
+        var index: u32 = @truncate(key);
+        if (key & (1 << 35) == 0) {
+            const codepoint: u21 = @intCast(index);
+            face = self.faceFor(codepoint, &.{}, @enumFromInt(@as(u2, @intCast(face))), cells);
+            index = freetype.FT_Get_Char_Index(self.faces[face], codepoint);
+        }
+        const rendered = try self.render(face, index, cells);
+        errdefer self.allocator.free(rendered.pixels);
+        try self.glyphs.put(self.allocator, key, rendered);
         return self.glyphs.getPtr(key).?;
+    }
+
+    fn render(self: *Font, face_index: u3, index: u32, cells: u2) !Glyph {
+        const face = self.faces[face_index];
+        if (face == null) return error.GlyphLoadFailed;
+        const emoji = face_index == emoji_face;
+        const flags: freetype.FT_Int32 = @intCast(freetype.FT_LOAD_RENDER | if (emoji) freetype.FT_LOAD_COLOR else freetype.FT_LOAD_TARGET_NORMAL);
+        if (freetype.FT_Load_Glyph(face, index, flags) != 0) return error.GlyphLoadFailed;
+        const slot = face.*.glyph.*;
+        const rendered = try Glyph.copy(self.allocator, slot.bitmap, slot.bitmap_left, slot.bitmap_top);
+        if (!emoji) return rendered;
+        defer self.allocator.free(rendered.pixels);
+        return self.fit(rendered, face.*.size.*.metrics, slot.advance.x, cells);
+    }
+
+    /// Scale an emoji's advance and line box to fit within its cells, centered.
+    fn fit(self: *const Font, rendered: Glyph, metrics: freetype.FT_Size_Metrics, advance: freetype.FT_Pos, cells: u2) !Glyph {
+        if (rendered.width == 0 or rendered.rows == 0) {
+            return .{ .pixels = try self.allocator.alloc(u8, 0), .width = 0, .rows = 0, .left = 0, .top = 0 };
+        }
+        const box_width: f32 = @floatFromInt(self.cell_width * cells);
+        const box_height: f32 = @floatFromInt(self.cell_height);
+        const ascender = @as(f32, @floatFromInt(metrics.ascender)) / 64;
+        const line = @max(1, ascender - @as(f32, @floatFromInt(metrics.descender)) / 64);
+        const width = if (advance > 0) @as(f32, @floatFromInt(advance)) / 64 else @as(f32, @floatFromInt(rendered.width));
+        const scale = @min(box_width / width, box_height / line);
+        var scaled = try rendered.resample(
+            self.allocator,
+            @max(1, @as(usize, @intFromFloat(@round(@as(f32, @floatFromInt(rendered.width)) * scale)))),
+            @max(1, @as(usize, @intFromFloat(@round(@as(f32, @floatFromInt(rendered.rows)) * scale)))),
+        );
+        const x = (box_width - width * scale) / 2 + @as(f32, @floatFromInt(rendered.left)) * scale;
+        const y = (box_height - line * scale) / 2 + (ascender - @as(f32, @floatFromInt(rendered.top))) * scale;
+        scaled.left = @intFromFloat(@round(x));
+        scaled.top = self.ascender - @as(i32, @intFromFloat(@round(y)));
+        return scaled;
+    }
+
+    /// Choose the emoji face for emoji presentation, otherwise the style's
+    /// text face, falling back to whichever face covers the base codepoint.
+    fn faceFor(self: *const Font, base: u21, extra: []const u21, style: FontStyle, cells: u2) u3 {
+        const text: u3 = @intFromEnum(style);
+        if (freetype.FT_Get_Char_Index(self.faces[emoji_face], base) == 0) return text;
+        var text_presentation = false;
+        for (extra) |codepoint| switch (codepoint) {
+            // VS16, ZWJ, keycaps, skin tones, and tag sequences form emoji.
+            0xFE0F, 0x200D, 0x20E3, 0x1F3FB...0x1F3FF, 0xE0020...0xE007F => return emoji_face,
+            0xFE0E => text_presentation = true,
+            else => {},
+        };
+        // The terminal's width tables make emoji-presentation codepoints wide.
+        if (freetype.FT_Get_Char_Index(self.faces[text], base) != 0 and (text_presentation or cells == 1)) return text;
+        return emoji_face;
+    }
+
+    /// Shape a multi-codepoint grapheme cluster once and cache its glyphs.
+    /// The result stays valid until deinit.
+    fn shape(self: *Font, base: u21, extra: []const u21, style: FontStyle, cells: u2) ![]const Placed {
+        self.cluster_key.clearRetainingCapacity();
+        try self.cluster_key.ensureUnusedCapacity(self.allocator, extra.len + 2);
+        self.cluster_key.appendAssumeCapacity(@intFromEnum(style) | (@as(u32, cells) << 2));
+        self.cluster_key.appendAssumeCapacity(base);
+        for (extra) |codepoint| self.cluster_key.appendAssumeCapacity(codepoint);
+        const key = std.mem.sliceAsBytes(self.cluster_key.items);
+        if (self.clusters.get(key)) |placed| return placed;
+
+        const placed = try self.shapeUncached(self.faceFor(base, extra, style, cells), self.cluster_key.items[1..], cells);
+        errdefer self.allocator.free(placed);
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+        try self.clusters.put(self.allocator, owned_key, placed);
+        return placed;
+    }
+
+    fn shapeUncached(self: *Font, face: u3, codepoints: []const u32, cells: u2) ![]const Placed {
+        if (self.faces[face] == null) return error.GlyphLoadFailed;
+        const shaper = self.shapers[face] orelse shaper: {
+            self.shapers[face] = harfbuzz.hb_ft_font_create_referenced(@ptrCast(self.faces[face]));
+            break :shaper self.shapers[face].?;
+        };
+        const buffer = self.buffer orelse buffer: {
+            self.buffer = harfbuzz.hb_buffer_create();
+            break :buffer self.buffer.?;
+        };
+        harfbuzz.hb_buffer_reset(buffer);
+        harfbuzz.hb_buffer_set_flags(buffer, harfbuzz.HB_BUFFER_FLAG_REMOVE_DEFAULT_IGNORABLES);
+        harfbuzz.hb_buffer_add_utf32(buffer, codepoints.ptr, @intCast(codepoints.len), 0, @intCast(codepoints.len));
+        harfbuzz.hb_buffer_guess_segment_properties(buffer);
+        harfbuzz.hb_shape(shaper, buffer, null, 0);
+        var count: c_uint = 0;
+        const infos = harfbuzz.hb_buffer_get_glyph_infos(buffer, &count);
+        const positions = harfbuzz.hb_buffer_get_glyph_positions(buffer, &count);
+
+        var placed: std.ArrayList(Placed) = .empty;
+        errdefer placed.deinit(self.allocator);
+        if (count == 0) return placed.toOwnedSlice(self.allocator);
+        var pen: i32 = 0;
+        for (infos[0..count], positions[0..count], 0..) |info, position, i| {
+            defer pen += position.x_advance;
+            // Omit marks the face lacks rather than boxing over the base.
+            if (info.codepoint == 0 and i > 0) continue;
+            if (face == emoji_face) {
+                // One emoji per cell: an unknown sequence shows its first emoji.
+                try placed.append(self.allocator, .{ .key = indexKey(face, info.codepoint, cells), .x = 0, .y = 0 });
+                break;
+            }
+            // HarfBuzz positions are 26.6 fixed point with y pointing up.
+            try placed.append(self.allocator, .{
+                .key = indexKey(face, info.codepoint, cells),
+                .x = @divFloor(pen + position.x_offset + 32, 64),
+                .y = -@divFloor(position.y_offset + 32, 64),
+            });
+        }
+        return placed.toOwnedSlice(self.allocator);
     }
 
     pub fn deinit(self: *Font) void {
         var values = self.glyphs.valueIterator();
-        while (values.next()) |cached| self.allocator.free(cached.alpha);
+        while (values.next()) |cached| self.allocator.free(cached.pixels);
         self.glyphs.deinit(self.allocator);
+        var clusters = self.clusters.iterator();
+        while (clusters.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.clusters.deinit(self.allocator);
+        self.cluster_key.deinit(self.allocator);
+        if (self.buffer) |buffer| harfbuzz.hb_buffer_destroy(buffer);
+        // Shapers hold face references, so release them before the faces.
+        for (self.shapers) |shaper| {
+            if (shaper) |font| harfbuzz.hb_font_destroy(font);
+        }
         for (self.faces) |face| {
             if (face != null) _ = freetype.FT_Done_Face(face);
         }
@@ -387,24 +580,59 @@ fn drawUnderline(self: *Self, font: *const Font, style: ghosttyvt.Style, rect: R
     }
 }
 
-/// Render one codepoint at a fixed grid origin, clipping overhang to its cells.
-fn drawGlyph(self: *Self, font: *Font, codepoint: u21, style: FontStyle, rect: Rect, color: u32) !void {
-    if (codepoint == 0 or codepoint == ' ') return;
-    const glyph = try font.glyph(codepoint, style);
+/// Composite premultiplied BGRA over an XRGB pixel.
+fn blendPremultiplied(bg: u32, bgra: *const [4]u8) u32 {
+    const inverse_alpha: u32 = 255 - bgra[3];
+    const red: u32 = @min(255, bgra[2] + (((bg >> 16) & 0xFF) * inverse_alpha + 127) / 255);
+    const green: u32 = @min(255, bgra[1] + (((bg >> 8) & 0xFF) * inverse_alpha + 127) / 255);
+    const blue: u32 = @min(255, bgra[0] + ((bg & 0xFF) * inverse_alpha + 127) / 255);
+    return (red << 16) | (green << 8) | blue;
+}
+
+test "blendPremultiplied composites color glyph pixels" {
+    try std.testing.expectEqual(@as(u32, 0x123456), blendPremultiplied(0x123456, &.{ 0, 0, 0, 0 }));
+    try std.testing.expectEqual(@as(u32, 0xFF8000), blendPremultiplied(0x123456, &.{ 0, 0x80, 0xFF, 255 }));
+    try std.testing.expectEqual(@as(u32, 0x807F7F), blendPremultiplied(0x00FFFF, &.{ 0, 0, 0x80, 128 }));
+}
+
+/// Draw a cell's grapheme cluster within rect, clipping overhang to its cells.
+fn drawCell(self: *Self, font: *Font, pin: ghosttyvt.Pin, cell: *const ghosttyvt.Cell, style: FontStyle, rect: Rect, color: u32) !void {
+    const codepoint = cell.codepoint();
+    if (codepoint == 0) return;
+    const extra: []const u21 = if (cell.hasGrapheme()) pin.grapheme(cell) orelse &.{} else &.{};
+    const cells = cell.gridWidth();
+    if (extra.len == 0) {
+        if (codepoint != ' ') self.drawGlyph(font, try font.glyph(glyphKey(codepoint, style, cells)), rect, 0, 0, color);
+        return;
+    }
+    for (try font.shape(codepoint, extra, style, cells)) |placed| {
+        self.drawGlyph(font, try font.glyph(placed.key), rect, placed.x, placed.y, color);
+    }
+}
+
+/// Coverage glyphs take `color`; color glyphs keep their own pixels.
+fn drawGlyph(self: *Self, font: *const Font, glyph: *const Glyph, rect: Rect, offset_x: i32, offset_y: i32, color: u32) void {
     const clipped = rect.clip(.{ .x = 0, .y = 0, .width = self.mode.hdisplay, .height = self.mode.vdisplay });
     const framebuffer = self.framebuffers[self.render_index];
     const pixels: [*]u32 = @ptrCast(@alignCast(framebuffer.map));
 
     for (0..glyph.rows) |row| {
-        const y = @as(i64, rect.y) + font.ascender - glyph.top + @as(i64, @intCast(row));
+        const y = @as(i64, rect.y) + font.ascender - glyph.top + offset_y + @as(i64, @intCast(row));
         if (y < clipped.y or y >= @as(i64, clipped.y) + clipped.height) continue;
         for (0..glyph.width) |column| {
-            const x = @as(i64, rect.x) + glyph.left + @as(i64, @intCast(column));
+            const x = @as(i64, rect.x) + glyph.left + offset_x + @as(i64, @intCast(column));
             if (x < clipped.x or x >= @as(i64, clipped.x) + clipped.width) continue;
-            const alpha = glyph.alpha[row * glyph.width + column];
-            if (alpha == 0) continue;
             const index = @as(usize, @intCast(y)) * framebuffer.stride + @as(usize, @intCast(x));
-            pixels[index] = if (alpha == 255) color else blendPixel(pixels[index], color, alpha);
+            const offset = row * glyph.width + column;
+            if (glyph.color) {
+                const bgra = glyph.pixels[offset * 4 ..][0..4];
+                if (bgra[3] == 0) continue;
+                pixels[index] = blendPremultiplied(pixels[index], bgra);
+            } else {
+                const alpha = glyph.pixels[offset];
+                if (alpha == 0) continue;
+                pixels[index] = if (alpha == 255) color else blendPixel(pixels[index], color, alpha);
+            }
         }
     }
 }
@@ -419,8 +647,9 @@ fn cursorRow(screen: *ghosttyvt.Screen) ?u16 {
 
 /// Redraw damaged viewport rows, without presenting. Returns false when
 /// the back buffer already matches the terminal and no page flip is needed.
-/// The terminal already decoded UTF-8; only the first codepoint of each
-/// grapheme is rendered. Shaping, fallback fonts, and cursor blinking are not implemented.
+/// Each cell's grapheme cluster is shaped and drawn within its cells; text
+/// does not shape across cells, so there are no programming ligatures.
+/// Cursor blinking is not implemented.
 pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
     if (self.flip_pending) return error.PageFlipPending;
     const screen = term.screens.active;
@@ -531,7 +760,7 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
                 .width = font.cell_width *| @as(u32, cell.gridWidth()),
                 .height = font.cell_height,
             };
-            try self.drawGlyph(font, cell.codepoint(), FontStyle.fromCell(style), rect, colors.fg);
+            try self.drawCell(font, pin, cell, FontStyle.fromCell(style), rect, colors.fg);
             const underline_color = if (style.underlineColor(&term.colors.palette.current)) |rgb| rgbPixel(rgb) else colors.fg;
             self.drawUnderline(font, style, rect, underline_color);
         }
@@ -620,7 +849,7 @@ fn drawCursor(self: *Self, font: *Font, term: *ghosttyvt.Terminal, row: u16) !vo
         .block => {
             self.fill_rect(cursor_color, rect);
             if (!style.flags.invisible) {
-                try self.drawGlyph(font, cell.codepoint(), FontStyle.fromCell(style), rect, colors.bg);
+                try self.drawCell(font, cursor_pin, cell, FontStyle.fromCell(style), rect, colors.bg);
                 self.drawUnderline(font, style, rect, colors.bg);
             }
         },
@@ -878,16 +1107,16 @@ test "bundled font faces load and cache each style independently" {
         const flags = font.faces[@intFromEnum(style)].*.style_flags;
         try std.testing.expectEqual(style == .bold or style == .bold_italic, flags & freetype.FT_STYLE_FLAG_BOLD != 0);
         try std.testing.expectEqual(style == .italic or style == .bold_italic, flags & freetype.FT_STYLE_FLAG_ITALIC != 0);
-        const glyph = try font.glyph('A', style);
-        try std.testing.expect(glyph.alpha.len > 0);
+        const glyph = try font.glyph(glyphKey('A', style, 1));
+        try std.testing.expect(glyph.pixels.len > 0 and !glyph.color);
     }
     try std.testing.expectEqual(@as(u32, 4), font.glyphs.count());
     for (styles, 0..) |style, i| {
-        const glyph = try font.glyph('A', style);
-        try std.testing.expect(glyph == try font.glyph('A', style));
+        const glyph = try font.glyph(glyphKey('A', style, 1));
+        try std.testing.expect(glyph == try font.glyph(glyphKey('A', style, 1)));
         for (styles[i + 1 ..]) |other| {
-            const other_glyph = try font.glyph('A', other);
-            try std.testing.expect(!std.mem.eql(u8, glyph.alpha, other_glyph.alpha));
+            const other_glyph = try font.glyph(glyphKey('A', other, 1));
+            try std.testing.expect(!std.mem.eql(u8, glyph.pixels, other_glyph.pixels));
         }
     }
     try std.testing.expectEqual(@as(u32, 4), font.glyphs.count());
@@ -911,7 +1140,7 @@ test "external font directory and family name load all four faces" {
     var font = try Font.init(allocator, .{ .directory = path_buffer[0..path_len], .name = "Custom" });
     defer font.deinit();
     for ([_]FontStyle{ .regular, .bold, .italic, .bold_italic }) |style| {
-        _ = try font.glyph('A', style);
+        _ = try font.glyph(glyphKey('A', style, 1));
     }
     // A missing style is a startup error, rather than silently using regular.
     try tmp.dir.deleteFile(std.testing.io, "Custom-BoldItalic.ttf");
@@ -930,18 +1159,18 @@ test "glyph masks own their pixels and normalize padded and negative pitch" {
     bitmap.pixel_mode = freetype.FT_PIXEL_MODE_GRAY;
     bitmap.buffer = &source;
     const glyph = try Glyph.copy(std.testing.allocator, bitmap, -1, 2);
-    defer std.testing.allocator.free(glyph.alpha);
-    try std.testing.expectEqualSlices(u8, &.{ 10, 20, 30, 40 }, glyph.alpha);
+    defer std.testing.allocator.free(glyph.pixels);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 20, 30, 40 }, glyph.pixels);
     source[0] = 50;
-    try std.testing.expectEqual(@as(u8, 10), glyph.alpha[0]);
+    try std.testing.expectEqual(@as(u8, 10), glyph.pixels[0]);
     try std.testing.expectEqual(@as(i32, -1), glyph.left);
     try std.testing.expectEqual(@as(i32, 2), glyph.top);
 
     bitmap.buffer = source[3..].ptr;
     bitmap.pitch = -3;
     const reversed = try Glyph.copy(std.testing.allocator, bitmap, 0, 0);
-    defer std.testing.allocator.free(reversed.alpha);
-    try std.testing.expectEqualSlices(u8, &.{ 30, 40, 50, 20 }, reversed.alpha);
+    defer std.testing.allocator.free(reversed.pixels);
+    try std.testing.expectEqualSlices(u8, &.{ 30, 40, 50, 20 }, reversed.pixels);
 }
 
 test "glyph masks unpack monochrome pixels across byte boundaries" {
@@ -953,10 +1182,32 @@ test "glyph masks unpack monochrome pixels across byte boundaries" {
     bitmap.pixel_mode = freetype.FT_PIXEL_MODE_MONO;
     bitmap.buffer = &source;
     const glyph = try Glyph.copy(std.testing.allocator, bitmap, 0, 0);
-    defer std.testing.allocator.free(glyph.alpha);
-    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 255, 0, 0, 0, 0, 255, 255 }, glyph.alpha);
-    bitmap.pixel_mode = freetype.FT_PIXEL_MODE_BGRA;
+    defer std.testing.allocator.free(glyph.pixels);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 255, 0, 0, 0, 0, 255, 255 }, glyph.pixels);
+    bitmap.pixel_mode = freetype.FT_PIXEL_MODE_LCD;
     try std.testing.expectError(error.UnsupportedGlyphPixelMode, Glyph.copy(std.testing.allocator, bitmap, 0, 0));
+}
+
+test "color glyphs copy BGRA rows and resample by area" {
+    // Two padded BGRA rows: opaque red and transparent, then two opaque blues.
+    var source = [_]u8{ 0, 0, 255, 255, 0, 0, 0, 0, 99, 255, 0, 0, 255, 255, 0, 0, 255, 99 };
+    var bitmap = std.mem.zeroes(freetype.FT_Bitmap);
+    bitmap.width = 2;
+    bitmap.rows = 2;
+    bitmap.pitch = 9;
+    bitmap.pixel_mode = freetype.FT_PIXEL_MODE_BGRA;
+    bitmap.buffer = &source;
+    const glyph = try Glyph.copy(std.testing.allocator, bitmap, 0, 0);
+    defer std.testing.allocator.free(glyph.pixels);
+    try std.testing.expect(glyph.color);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255, 0, 0, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255 }, glyph.pixels);
+    const averaged = try glyph.resample(std.testing.allocator, 1, 1);
+    defer std.testing.allocator.free(averaged.pixels);
+    try std.testing.expectEqualSlices(u8, &.{ 128, 0, 64, 191 }, averaged.pixels);
+    const enlarged = try glyph.resample(std.testing.allocator, 4, 4);
+    defer std.testing.allocator.free(enlarged.pixels);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, enlarged.pixels[4..8]);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, enlarged.pixels[60..64]);
 }
 
 test "framebuffer fills clip rectangles and respect padded stride" {
@@ -983,9 +1234,9 @@ test "cached glyphs render with backgrounds, reverse colors and transparent pixe
     defer font.glyphs.deinit(allocator);
     const alpha = try allocator.dupe(u8, &.{ 255, 0 });
     defer allocator.free(alpha);
-    try font.glyphs.put(allocator, 'A', .{ .alpha = alpha, .width = 2, .rows = 1, .left = 0, .top = 0 });
-    const first = try font.glyph('A', .regular);
-    try std.testing.expect(first == try font.glyph('A', .regular));
+    try font.glyphs.put(allocator, glyphKey('A', .regular, 1), .{ .pixels = alpha, .width = 2, .rows = 1, .left = 0, .top = 0 });
+    const first = try font.glyph(glyphKey('A', .regular, 1));
+    try std.testing.expect(first == try font.glyph(glyphKey('A', .regular, 1)));
 
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 1 });
     defer term.deinit(allocator);
@@ -1017,7 +1268,7 @@ test "SGR font styles and block cursor use the matching cached face" {
         const alpha = try allocator.alloc(u8, 4);
         @memset(alpha, 0);
         alpha[i] = 255;
-        try font.glyphs.put(allocator, glyphKey('A', style), .{ .alpha = alpha, .width = 4, .rows = 1, .left = 0, .top = 0 });
+        try font.glyphs.put(allocator, glyphKey('A', style, 1), .{ .pixels = alpha, .width = 4, .rows = 1, .left = 0, .top = 0 });
     }
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 5, .rows = 1 });
     defer term.deinit(allocator);
@@ -1087,7 +1338,7 @@ test "underlines cover spaces and wide cells with colors, resets and invisibilit
     font.underline_position = 2;
     defer font.deinit();
     const alpha = try allocator.dupe(u8, &.{ 255, 255, 255, 255 });
-    try font.glyphs.put(allocator, '界', .{ .alpha = alpha, .width = 4, .rows = 1, .left = 0, .top = 0 });
+    try font.glyphs.put(allocator, glyphKey('界', .regular, 2), .{ .pixels = alpha, .width = 4, .rows = 1, .left = 0, .top = 0 });
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 7, .rows = 1 });
     defer term.deinit(allocator);
     try Colors.configure(&term, allocator);
@@ -1105,6 +1356,96 @@ test "underlines cover spaces and wide cells with colors, resets and invisibilit
     stream.nextSlice("\x1b[1;2H\x1b[4;58;5;1m \x1b]4;1;#abcdef\x07");
     _ = try renderer.drawTerminal(&font, &term);
     try std.testing.expectEqual(@as(u32, 0xabcdef), pixels[30]);
+}
+
+test "grapheme clusters choose faces by presentation and compose combining marks" {
+    const allocator = std.testing.allocator;
+    var font = try Font.init(allocator, .{ .pixel_size = 16 });
+    defer font.deinit();
+    const regular: u3 = @intFromEnum(FontStyle.regular);
+    try std.testing.expectEqual(@as(u3, @intFromEnum(FontStyle.bold)), font.faceFor('A', &.{}, .bold, 1));
+    try std.testing.expectEqual(emoji_face, font.faceFor(0x1F600, &.{}, .bold, 2));
+    // Both faces cover these: narrow cells and VS15 mean text, wide cells and VS16 mean emoji.
+    try std.testing.expectEqual(regular, font.faceFor(0x26A0, &.{}, .regular, 1));
+    try std.testing.expectEqual(emoji_face, font.faceFor(0x26A0, &.{0xFE0F}, .regular, 2));
+    try std.testing.expectEqual(emoji_face, font.faceFor(0x26A1, &.{}, .regular, 2));
+    try std.testing.expectEqual(regular, font.faceFor(0x26A1, &.{0xFE0E}, .regular, 2));
+    try std.testing.expectEqual(regular, font.faceFor('#', &.{}, .regular, 1));
+    try std.testing.expectEqual(emoji_face, font.faceFor('#', &.{0x20E3}, .regular, 1));
+
+    const text = font.faces[regular];
+    const composed = try font.shape('e', &.{0x0301}, .regular, 1);
+    try std.testing.expectEqual(@as(usize, 1), composed.len);
+    try std.testing.expectEqual(indexKey(regular, freetype.FT_Get_Char_Index(text, 0xE9), 1), composed[0].key);
+    try std.testing.expect(composed.ptr == (try font.shape('e', &.{0x0301}, .regular, 1)).ptr);
+    // Without a precomposed form, the mark is a second glyph over the base.
+    const stacked = try font.shape('q', &.{0x0301}, .regular, 1);
+    try std.testing.expectEqual(@as(usize, 2), stacked.len);
+    try std.testing.expectEqual(indexKey(regular, freetype.FT_Get_Char_Index(text, 0x0301), 1), stacked[1].key);
+    // Zero-advance marks draw back from the pen, so their ink lands in the cell.
+    const mark = try font.glyph(stacked[1].key);
+    const ink_center = stacked[1].x + mark.left + @as(i32, @intCast(mark.width / 2));
+    try std.testing.expect(ink_center >= 0 and ink_center < font.cell_width);
+    try std.testing.expect(font.ascender - mark.top + stacked[1].y < @divFloor(font.ascender, 2));
+    // A mark the face lacks is dropped instead of boxing over the base.
+    const missing = try font.shape('a', &.{0x0331}, .regular, 1);
+    try std.testing.expectEqual(@as(usize, 1), missing.len);
+    try std.testing.expectEqual(indexKey(regular, freetype.FT_Get_Char_Index(text, 'a'), 1), missing[0].key);
+}
+
+test "emoji sequences render as one color glyph within their cells" {
+    const allocator = std.testing.allocator;
+    var font = try Font.init(allocator, .{ .pixel_size = 16 });
+    defer font.deinit();
+    const cols = 14;
+    var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{
+        .cols = cols,
+        .rows = 1,
+        .default_modes = .{ .grapheme_cluster = true },
+    });
+    defer term.deinit(allocator);
+    try Colors.configure(&term, allocator);
+    var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
+    defer stream.deinit();
+    // A skin tone, a ZWJ family, a flag, a keycap, a VS16 heart, and a plain emoji.
+    stream.nextSlice("\x1b[?25l\u{1F44D}\u{1F3FD}\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{1F1FA}\u{1F1F8}1\u{FE0F}\u{20E3}\u{2764}\u{FE0F}\u{1F600}");
+
+    const pin = term.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?;
+    var count: usize = 0;
+    for (pin.cells(.all), 0..) |*cell, column| {
+        if (cell.codepoint() == 0 or cell.wide == .spacer_tail) continue;
+        const cells = cell.gridWidth();
+        const key = if (pin.grapheme(cell)) |extra| key: {
+            const placed = try font.shape(cell.codepoint(), extra, .regular, cells);
+            try std.testing.expectEqual(@as(usize, 1), placed.len);
+            break :key placed[0].key;
+        } else glyphKey(cell.codepoint(), .regular, cells);
+        if (count == 1) {
+            // The family has its own glyph, rather than the man that starts it.
+            const man = freetype.FT_Get_Char_Index(font.faces[emoji_face], 0x1F468);
+            try std.testing.expect(key != indexKey(emoji_face, man, cells));
+        }
+        const glyph = try font.glyph(key);
+        try std.testing.expect(glyph.color);
+        try std.testing.expect(glyph.width > 0 and glyph.left >= 0 and glyph.left + @as(i64, @intCast(glyph.width)) <= font.cell_width * cells);
+        const top = font.ascender - glyph.top;
+        try std.testing.expect(top >= 0 and top + @as(i64, @intCast(glyph.rows)) <= font.cell_height);
+        try std.testing.expect(column + cells <= cols);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 6), count);
+
+    const width = cols * font.cell_width;
+    const pixels = try allocator.alloc(u32, width * font.cell_height);
+    defer allocator.free(pixels);
+    var renderer = testRenderer(pixels, @intCast(width), @intCast(font.cell_height), width);
+    defer renderer.damage.deinit(allocator);
+    _ = try renderer.drawTerminal(&font, &term);
+    var colored: usize = 0;
+    for (pixels) |pixel| {
+        if ((pixel >> 16) & 0xFF != pixel & 0xFF) colored += 1;
+    }
+    try std.testing.expect(colored > pixels.len / 8);
 }
 
 fn testFont() Font {
@@ -1357,7 +1698,7 @@ test "pending flips retain source damage and wide cursor moves erase the old row
     defer font.glyphs.deinit(allocator);
     const alpha = try allocator.dupe(u8, &.{ 255, 128 });
     defer allocator.free(alpha);
-    try font.glyphs.put(allocator, '界', .{ .alpha = alpha, .width = 2, .rows = 1, .left = 0, .top = 0 });
+    try font.glyphs.put(allocator, glyphKey('界', .regular, 2), .{ .pixels = alpha, .width = 2, .rows = 1, .left = 0, .top = 0 });
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 3 });
     defer term.deinit(allocator);
     try Colors.configure(&term, allocator);
@@ -1411,7 +1752,7 @@ test "failed row drawing retains damage until a successful retry" {
     try std.testing.expect(pin.rowAndCell().row.dirty);
     const alpha = try allocator.dupe(u8, &.{255});
     defer allocator.free(alpha);
-    try font.glyphs.put(allocator, 'A', .{ .alpha = alpha, .width = 1, .rows = 1, .left = 0, .top = 0 });
+    try font.glyphs.put(allocator, glyphKey('A', .regular, 1), .{ .pixels = alpha, .width = 1, .rows = 1, .left = 0, .top = 0 });
     try std.testing.expect(try renderer.drawTerminal(&font, &term));
     try std.testing.expect(!pin.rowAndCell().row.dirty);
     try std.testing.expectEqual(rgbPixel(Colors.foreground), pixels[0][3]);
