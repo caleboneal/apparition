@@ -10,6 +10,7 @@ const Seat = @import("seat.zig");
 const Colors = @import("colors.zig");
 const Images = @import("renderer/images.zig");
 const Box = @import("renderer/box.zig");
+const Powerline = @import("renderer/powerline.zig");
 
 const Self = @This();
 
@@ -207,10 +208,16 @@ pub const Font = struct {
         const index: u32 = @truncate(key);
         if (key & (1 << 35) != 0) return self.render(face, index, cells);
         const codepoint: u21 = @intCast(index);
-        if (Box.covers(codepoint)) {
-            const width = self.cell_width * cells;
+        const width = self.cell_width * cells;
+        const drawn = if (Box.covers(codepoint))
+            try Box.draw(self.allocator, codepoint, width, self.cell_height, self.underline_thickness)
+        else if (Powerline.covers(codepoint))
+            try Powerline.draw(self.allocator, codepoint, width, self.cell_height, self.underline_thickness)
+        else
+            null;
+        if (drawn) |pixels| {
             return .{
-                .pixels = try Box.draw(self.allocator, codepoint, width, self.cell_height, self.underline_thickness),
+                .pixels = pixels,
                 .width = width,
                 .rows = self.cell_height,
                 .left = 0,
@@ -1504,6 +1511,18 @@ test "box drawing ignores the font's glyphs and spans the font's cell" {
     try std.testing.expectEqual(font.ascender, glyph.top);
     const column = (font.cell_width - font.underline_thickness) / 2;
     for (0..glyph.rows) |row| try std.testing.expectEqual(@as(u8, 255), glyph.pixels[row * glyph.width + column]);
+}
+
+test "powerline separators ignore the font's glyphs and fill the font's cell" {
+    var font = try Font.init(std.testing.allocator, .{ .pixel_size = 16 });
+    defer font.deinit();
+    for ([_]u21{ 0xE0B0, 0xE0B4 }) |codepoint| {
+        const glyph = try font.glyph(glyphKey(codepoint, .regular, 1));
+        try std.testing.expectEqual(@as(usize, font.cell_width), glyph.width);
+        try std.testing.expectEqual(@as(usize, font.cell_height), glyph.rows);
+        try std.testing.expectEqual(font.ascender, glyph.top);
+        for (1..glyph.rows - 1) |row| try std.testing.expectEqual(@as(u8, 255), glyph.pixels[row * glyph.width]);
+    }
 }
 
 fn testFont() Font {

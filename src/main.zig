@@ -349,6 +349,7 @@ test {
     _ = @import("input/keyboard.zig");
     _ = @import("renderer.zig");
     _ = @import("renderer/box.zig");
+    _ = @import("renderer/powerline.zig");
     _ = @import("seat.zig");
     _ = @import("png.zig");
 }

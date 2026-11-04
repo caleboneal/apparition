@@ -284,7 +284,7 @@ const Canvas = struct {
     }
 };
 
-fn segmentDistance(x: f32, y: f32, ax: f32, ay: f32, bx: f32, by: f32) f32 {
+pub fn segmentDistance(x: f32, y: f32, ax: f32, ay: f32, bx: f32, by: f32) f32 {
     const dx = bx - ax;
     const dy = by - ay;
     const t = std.math.clamp(((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy), 0, 1);

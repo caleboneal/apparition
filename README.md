@@ -97,6 +97,12 @@ thickness; heavy lines are twice that, and double lines are spaced by it. This
 covers light, heavy, and double lines with their mixed junctions, dashed
 lines, rounded corners, and diagonals.
 
+Powerline separators (U+E0B0 to U+E0BF) are drawn the same way, so prompts
+such as starship's render with any font, without a Nerd Font, and their solid
+shapes meet neighboring cell backgrounds without gaps. This covers the solid
+and thin arrows, solid and outlined half circles, corner triangles, and slash
+separators. Other Nerd Font icons still need a font that has them.
+
 This is still rudimentary: no mouse input,
 clipboard, IME/compose, fallback beyond the emoji font, or display hotplug/
 resize handling. Bold,
@@ -175,4 +181,6 @@ placement, color glyph copying, resampling, and blending, and render skin-tone,
 ZWJ, flag, keycap, and VS16 sequences as single color glyphs within their
 cells. Box drawing tests check exact pixels for lines, junctions, nested double
 corners, dashes, and arcs, that every character reaches the cell edges its
-lines point to, and that boxes join across neighboring cells.
+lines point to, and that boxes join across neighboring cells. Powerline tests
+check that left and right separators mirror each other, solid shapes cover
+their flat edge, and separators bypass the font.
