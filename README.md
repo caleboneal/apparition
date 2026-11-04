@@ -90,6 +90,13 @@ made it wide; or when the text font lacks it. VS15 asks for the text font.
 Color emoji keep their colors (including under a block cursor) and are scaled
 to fit their cells, centered.
 
+Box drawing characters (U+2500 to U+257F) are drawn by Apparition rather than
+taken from the font, so they fill each cell exactly and join across cells with
+no gaps, whatever the font's metrics. Light lines use the font's underline
+thickness; heavy lines are twice that, and double lines are spaced by it. This
+covers light, heavy, and double lines with their mixed junctions, dashed
+lines, rounded corners, and diagonals.
+
 This is still rudimentary: no mouse input,
 clipboard, IME/compose, fallback beyond the emoji font, or display hotplug/
 resize handling. Bold,
@@ -164,4 +171,6 @@ and cover styled block cursors and underlines on spaces and wide cells. Emoji
 and grapheme tests cover presentation selection, combining mark composition and
 placement, color glyph copying, resampling, and blending, and render skin-tone,
 ZWJ, flag, keycap, and VS16 sequences as single color glyphs within their
-cells.
+cells. Box drawing tests check exact pixels for lines, junctions, nested double
+corners, dashes, and arcs, that every character reaches the cell edges its
+lines point to, and that boxes join across neighboring cells.

@@ -9,6 +9,7 @@ const Drm = @import("drm.zig");
 const Seat = @import("seat.zig");
 const Colors = @import("colors.zig");
 const Images = @import("renderer/images.zig");
+const Box = @import("renderer/box.zig");
 
 const Self = @This();
 
@@ -194,18 +195,30 @@ pub const Font = struct {
     /// Look up a glyphKey or indexKey, rendering it on first use.
     fn glyph(self: *Font, key: u64) !*const Glyph {
         if (self.glyphs.getPtr(key)) |cached| return cached;
-        const cells: u2 = @truncate(key >> 36);
-        var face: u3 = @truncate(key >> 32);
-        var index: u32 = @truncate(key);
-        if (key & (1 << 35) == 0) {
-            const codepoint: u21 = @intCast(index);
-            face = self.faceFor(codepoint, &.{}, @enumFromInt(@as(u2, @intCast(face))), cells);
-            index = freetype.FT_Get_Char_Index(self.faces[face], codepoint);
-        }
-        const rendered = try self.render(face, index, cells);
+        const rendered = try self.renderKey(key);
         errdefer self.allocator.free(rendered.pixels);
         try self.glyphs.put(self.allocator, key, rendered);
         return self.glyphs.getPtr(key).?;
+    }
+
+    fn renderKey(self: *Font, key: u64) !Glyph {
+        const cells: u2 = @truncate(key >> 36);
+        const face: u3 = @truncate(key >> 32);
+        const index: u32 = @truncate(key);
+        if (key & (1 << 35) != 0) return self.render(face, index, cells);
+        const codepoint: u21 = @intCast(index);
+        if (Box.covers(codepoint)) {
+            const width = self.cell_width * cells;
+            return .{
+                .pixels = try Box.draw(self.allocator, codepoint, width, self.cell_height, self.underline_thickness),
+                .width = width,
+                .rows = self.cell_height,
+                .left = 0,
+                .top = self.ascender,
+            };
+        }
+        const resolved = self.faceFor(codepoint, &.{}, @enumFromInt(@as(u2, @intCast(face))), cells);
+        return self.render(resolved, freetype.FT_Get_Char_Index(self.faces[resolved], codepoint), cells);
     }
 
     fn render(self: *Font, face_index: u3, index: u32, cells: u2) !Glyph {
@@ -1446,6 +1459,48 @@ test "emoji sequences render as one color glyph within their cells" {
         if ((pixel >> 16) & 0xFF != pixel & 0xFF) colored += 1;
     }
     try std.testing.expect(colored > pixels.len / 8);
+}
+
+test "box drawing fills whole cells so lines join across rows and columns" {
+    const allocator = std.testing.allocator;
+    var font = testFont();
+    font.cell_width = 5;
+    font.cell_height = 7;
+    font.ascender = 5;
+    defer font.deinit();
+    var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 3 });
+    defer term.deinit(allocator);
+    try Colors.configure(&term, allocator);
+    var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?25l┌─┐\r\n│ │\r\n└─┘");
+    var pixels = [_]u32{0} ** (15 * 21);
+    var renderer = testRenderer(&pixels, 15, 21, 15);
+    defer renderer.damage.deinit(allocator);
+    _ = try renderer.drawTerminal(&font, &term);
+    const fg = rgbPixel(Colors.foreground);
+    // Each cell's light lines sit on row 3 and column 2 of the cell.
+    for (2..13) |x| {
+        try std.testing.expectEqual(fg, pixels[3 * 15 + x]);
+        try std.testing.expectEqual(fg, pixels[17 * 15 + x]);
+    }
+    for (3..18) |y| {
+        try std.testing.expectEqual(fg, pixels[y * 15 + 2]);
+        try std.testing.expectEqual(fg, pixels[y * 15 + 12]);
+    }
+    try std.testing.expectEqual(@as(u32, 0), pixels[2 * 15 + 2]);
+    try std.testing.expectEqual(@as(u32, 0), pixels[10 * 15 + 7]);
+}
+
+test "box drawing ignores the font's glyphs and spans the font's cell" {
+    var font = try Font.init(std.testing.allocator, .{ .pixel_size = 16 });
+    defer font.deinit();
+    const glyph = try font.glyph(glyphKey(0x2502, .bold, 1));
+    try std.testing.expectEqual(@as(usize, font.cell_width), glyph.width);
+    try std.testing.expectEqual(@as(usize, font.cell_height), glyph.rows);
+    try std.testing.expectEqual(font.ascender, glyph.top);
+    const column = (font.cell_width - font.underline_thickness) / 2;
+    for (0..glyph.rows) |row| try std.testing.expectEqual(@as(u8, 255), glyph.pixels[row * glyph.width + column]);
 }
 
 fn testFont() Font {
