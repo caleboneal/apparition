@@ -39,11 +39,21 @@ pub const Visible = struct {
     /// Straight-alpha RGBA of the source pixel shown at display pixel (x, y),
     /// which must lie inside the destination rectangle.
     pub fn sample(self: Visible, x: i64, y: i64) [4]u8 {
+        return self.pixel(self.row(y), x);
+    }
+
+    /// The source row shown on display row y, for pixel.
+    pub fn row(self: Visible, y: i64) []const u8 {
+        const g = self.geometry;
+        const sy = g.source.y + scale(y - g.y, g.source.height, g.height);
+        return self.data[@as(usize, sy) * self.image_width * bytesPerPixel(self.format) ..];
+    }
+
+    /// Straight-alpha RGBA shown at display column x of a source row.
+    pub fn pixel(self: Visible, source_row: []const u8, x: i64) [4]u8 {
         const g = self.geometry;
         const sx = g.source.x + scale(x - g.x, g.source.width, g.width);
-        const sy = g.source.y + scale(y - g.y, g.source.height, g.height);
-        const index = (@as(usize, sy) * self.image_width + sx) * bytesPerPixel(self.format);
-        const p = self.data[index..];
+        const p = source_row[@as(usize, sx) * bytesPerPixel(self.format) ..];
         return switch (self.format) {
             .rgb => .{ p[0], p[1], p[2], 255 },
             .rgba => .{ p[0], p[1], p[2], p[3] },

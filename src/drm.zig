@@ -3,17 +3,15 @@ const libdrm = @import("libdrm");
 const Seat = @import("seat.zig");
 const log = std.log.scoped(.drm);
 
-/// Owns the primary-node fd, opened through the seat, and the three libdrm
-/// allocations. The seat provider grants and revokes DRM master.
-/// Discovery does not modeset. The caller must use crtc_id (not encoder.crtc_id),
-/// and restore any modeset / release framebuffers before calling deinit.
+/// Owns the primary-node fd, opened through the seat, and the selected route.
+/// The seat provider grants and revokes DRM master.
+/// Discovery does not modeset. The caller must restore any modeset and
+/// release framebuffers before calling deinit.
 /// Treat this as move-only; deinit must be called exactly once after success.
 pub const Device = struct {
     seat: *Seat,
     fd: c_int,
-    resources: *libdrm.drmModeRes,
-    connector: *libdrm.drmModeConnector,
-    encoder: *libdrm.drmModeEncoder,
+    connector_id: u32,
     mode: libdrm.drmModeModeInfo,
     crtc_id: u32,
 
@@ -56,9 +54,6 @@ pub const Device = struct {
     }
 
     pub fn deinit(self: *Device) void {
-        libdrm.drmModeFreeEncoder(self.encoder);
-        libdrm.drmModeFreeConnector(self.connector);
-        libdrm.drmModeFreeResources(self.resources);
         self.seat.closeDevice(self.fd);
         self.* = undefined;
     }
@@ -80,7 +75,7 @@ fn openCandidate(seat: *Seat, path: [*:0]const u8) !Device {
         log.warn("Cannot get KMS resources on {s}: errno {d}", .{ path, std.c._errno().* });
         return error.NoKmsResources;
     };
-    errdefer libdrm.drmModeFreeResources(resources);
+    defer libdrm.drmModeFreeResources(resources);
     if (drmSlice(u32, resources.crtcs, resources.count_crtcs).len == 0 or
         drmSlice(u32, resources.connectors, resources.count_connectors).len == 0 or
         drmSlice(u32, resources.encoders, resources.count_encoders).len == 0)
@@ -96,15 +91,13 @@ fn openCandidate(seat: *Seat, path: [*:0]const u8) !Device {
 
     const selection = try selectDisplay(fd, resources);
     log.info("Selected {s}: connector {d}, encoder {d}, CRTC {d}, {d}x{d}", .{
-        path,              selection.connector.connector_id, selection.encoder.encoder_id,
-        selection.crtc_id, selection.mode.hdisplay,          selection.mode.vdisplay,
+        path,              selection.connector_id,   selection.encoder_id,
+        selection.crtc_id, selection.mode.hdisplay, selection.mode.vdisplay,
     });
     return .{
         .seat = seat,
         .fd = fd,
-        .resources = resources,
-        .connector = selection.connector,
-        .encoder = selection.encoder,
+        .connector_id = selection.connector_id,
         .mode = selection.mode,
         .crtc_id = selection.crtc_id,
     };
@@ -135,8 +128,8 @@ const Output = struct {
 };
 
 const Selection = struct {
-    connector: *libdrm.drmModeConnector,
-    encoder: *libdrm.drmModeEncoder,
+    connector_id: u32,
+    encoder_id: u32,
     mode: libdrm.drmModeModeInfo,
     crtc_id: u32,
 };
@@ -185,7 +178,7 @@ fn selectDisplay(fd: c_int, resources: *const libdrm.drmModeRes) !Selection {
             const connector = output.connector.?;
             if (output.encoder) |encoder| {
                 if (chooseOutputCrtc(output, encoder, crtcs, outputs, current_only)) |crtc_id|
-                    return takeSelection(output, encoder, crtc_id);
+                    return select(output, encoder, crtc_id);
             }
             if (current_only) continue;
             for (drmSlice(u32, connector.encoders, connector.count_encoders)) |encoder_id| {
@@ -195,9 +188,9 @@ fn selectDisplay(fd: c_int, resources: *const libdrm.drmModeRes) !Selection {
                     log.warn("Cannot inspect encoder {d} for connector {d}: errno {d}", .{ encoder_id, connector.connector_id, std.c._errno().* });
                     continue;
                 };
+                defer libdrm.drmModeFreeEncoder(encoder);
                 if (chooseOutputCrtc(output, encoder, crtcs, outputs, current_only)) |crtc_id|
-                    return takeSelection(output, encoder, crtc_id);
-                libdrm.drmModeFreeEncoder(encoder);
+                    return select(output, encoder, crtc_id);
             }
         }
     }
@@ -217,17 +210,13 @@ fn chooseOutputCrtc(output: *const Output, encoder: *const libdrm.drmModeEncoder
     return crtc_id;
 }
 
-fn takeSelection(output: *Output, encoder: *libdrm.drmModeEncoder, crtc_id: u32) Selection {
-    const selection: Selection = .{
-        .connector = output.connector.?,
-        .encoder = encoder,
+fn select(output: *const Output, encoder: *const libdrm.drmModeEncoder, crtc_id: u32) Selection {
+    return .{
+        .connector_id = output.route.connector_id,
+        .encoder_id = encoder.encoder_id,
         .mode = output.mode.?,
         .crtc_id = crtc_id,
     };
-
-    output.connector = null;
-    if (output.encoder == encoder) output.encoder = null;
-    return selection;
 }
 
 fn crtcSupported(possible: u32, index: usize) bool {

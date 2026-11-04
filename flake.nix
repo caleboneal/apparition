@@ -24,7 +24,6 @@
               pkgs.zig
               pkgs.pkg-config
               pkgs.libdrm
-              pkgs.libgbm
               pkgs.freetype
               pkgs.harfbuzz
               pkgs.libpng
@@ -32,7 +31,6 @@
               pkgs.seatd
               pkgs.systemd
               pkgs.libxkbcommon
-              pkgs.libGL # Provides EGL and OpenGL headers
             ];
           };
         });

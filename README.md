@@ -63,16 +63,20 @@ active, Apparition quits without touching the display.
 
 Use `exit` or Ctrl-D at an empty shell prompt to close the terminal. Normal
 shutdown restores the previous display and console keyboard modes and reaps
-the shell. The event loop polls PTY, input, and pending DRM page-flip events
-instead of busy-spinning or blocking on vblank. Output updates are coalesced
-at the display refresh rate (60 Hz if the mode does not report one).
+the shell. The event loop polls PTY, input, shell exit (through a pidfd, so
+Linux 5.3 or later is required), and pending DRM page-flip events instead of
+busy-spinning or blocking on vblank, and an idle terminal sleeps without a
+timeout. Output updates are coalesced at the display refresh rate (60 Hz if
+the mode does not report one).
 
 Rendering caches glyphs by codepoint, font style, and cell width at the
-configured font size and repaints only damaged rows. Damage accumulates
-independently for both framebuffers, including
-the old and new cursor rows. Screen, palette, default-color, and grid changes
-trigger full redraws (including display margins). Once the back buffer is
-current, nonvisual output does not cause another page flip.
+configured font size and repaints only damaged rows, including the old and
+new cursor rows. Rows are drawn into a buffer in system memory, since dumb
+buffers are often slow to read back, and each framebuffer then receives a copy
+of the rows that changed since it was last drawn. Screen, palette,
+default-color, and grid changes trigger full redraws (including display
+margins). Once the back buffer is current, nonvisual output does not cause
+another page flip.
 
 Grapheme clustering (mode 2027) is on by default, so emoji ZWJ sequences,
 flags, skin tones, keycaps, and combining marks each occupy one cell (wide for

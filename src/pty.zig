@@ -20,6 +20,9 @@ const Self = @This();
 
 fd: c_int,
 pid: c.pid_t,
+/// Becomes readable when the shell exits, even while descendants hold the
+/// PTY open.
+pidfd: c_int = -1,
 reaped: bool = false,
 pending: std.ArrayList(u8) = .empty,
 written: usize = 0,
@@ -67,6 +70,9 @@ pub fn init(allocator: std.mem.Allocator, shell: [*:0]const u8, window: Size) !S
     write_pipe_open = false;
     var self = Self{ .fd = master, .pid = pid, .allocator = allocator };
     errdefer self.deinit();
+    const pidfd = std.os.linux.pidfd_open(pid, 0);
+    if (std.os.linux.errno(pidfd) != .SUCCESS) return error.PidfdOpenFailed;
+    self.pidfd = @intCast(pidfd);
 
     var failure: [1]u8 = undefined;
     while (true) {
@@ -84,6 +90,7 @@ pub fn init(allocator: std.mem.Allocator, shell: [*:0]const u8, window: Size) !S
 
 pub fn deinit(self: *Self) void {
     _ = c.close(self.fd);
+    if (self.pidfd >= 0) _ = c.close(self.pidfd);
     self.pending.deinit(self.allocator);
     if (self.reaped) return;
 
@@ -191,6 +198,16 @@ test "PTY starts an interactive shell with a controlling terminal and window siz
     try std.testing.expect(closed);
     try std.testing.expect(std.mem.indexOf(u8, output.items, "31 97\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items, "pty-ready\r\n") != null);
+}
+
+test "pidfd reports shell exit while a descendant holds the PTY open" {
+    var pty = try Self.init(std.testing.allocator, "/bin/sh", .{ .rows = 24, .cols = 80 });
+    defer pty.deinit();
+    try pty.queue("(sleep 1 &); exit\r");
+    try pty.flush();
+    var fd = c.struct_pollfd{ .fd = pty.pidfd, .events = c.POLLIN, .revents = 0 };
+    try std.testing.expectEqual(@as(c_int, 1), c.poll(&fd, 1, 5000));
+    try std.testing.expect(pty.exited());
 }
 
 test "PTY reports a shell exec failure" {

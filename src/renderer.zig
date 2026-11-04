@@ -378,6 +378,9 @@ const RowDamage = struct {
     node: usize = 0,
     serial: u64 = 0,
     page_y: u16 = 0,
+    /// The shadow buffer's copy of the row is out of date.
+    stale: bool = true,
+    /// Framebuffers whose copy of the row is out of date.
     pending: [2]bool = .{ true, true },
 };
 
@@ -404,6 +407,9 @@ const CursorState = struct {
 
 const Damage = struct {
     rows: std.ArrayList(RowDamage) = .empty,
+    /// Repaint the whole shadow buffer, display margins included.
+    clear: bool = true,
+    /// Framebuffers to copy whole from the shadow buffer.
     full: [2]bool = .{ true, true },
     key: ?RenderKey = null,
     cursor: ?CursorState = null,
@@ -413,12 +419,18 @@ const Damage = struct {
     }
 
     fn invalidate(self: *Damage) void {
+        self.clear = true;
         self.full = .{ true, true };
-        for (self.rows.items) |*row| row.pending = .{ true, true };
+        for (self.rows.items) |*row| {
+            row.stale = true;
+            row.pending = .{ true, true };
+        }
     }
 
     fn mark(self: *Damage, y: usize) void {
-        if (y < self.rows.items.len) self.rows.items[y].pending = .{ true, true };
+        if (y >= self.rows.items.len) return;
+        self.rows.items[y].stale = true;
+        self.rows.items[y].pending = .{ true, true };
     }
 };
 
@@ -428,6 +440,10 @@ device: Drm.Device,
 fd: c_int,
 mode: libdrm.drmModeModeInfo,
 framebuffers: [2]Framebuffer,
+/// Frames are drawn here, then damaged rows are copied to the back buffer:
+/// blending reads pixels back, and dumb buffers are often uncached memory.
+/// Shares the framebuffers' stride.
+shadow: Canvas,
 display_index: ?usize = null,
 render_index: usize = 0,
 flip_pending: bool = false,
@@ -457,6 +473,8 @@ pub fn init(allocator: std.mem.Allocator, seat: *Seat) !Self {
         framebuffer.* = try createFramebuffer(fd, mode);
         framebuffer_count += 1;
     }
+    const stride = framebuffers[0].stride;
+    const shadow = try allocator.alloc(u32, stride * mode.vdisplay);
 
     return .{
         .allocator = allocator,
@@ -464,6 +482,7 @@ pub fn init(allocator: std.mem.Allocator, seat: *Seat) !Self {
         .fd = fd,
         .mode = mode,
         .framebuffers = framebuffers,
+        .shadow = .{ .pixels = shadow, .width = mode.hdisplay, .height = mode.vdisplay, .stride = stride },
         .saved_crtc = saved_crtc,
     };
 }
@@ -499,28 +518,122 @@ test "Rect.clip intersects edges and handles disjoint and overflowing bounds" {
     try std.testing.expectEqual(@as(u32, 10), overflowing.height);
 }
 
-pub fn fill_rect(self: *Self, color: u32, rect: Rect) void {
-    const framebuffer = self.framebuffers[self.render_index];
-    const pixels: [*]u32 = @ptrCast(@alignCast(framebuffer.map));
-    const clipped_rect = rect.clip(Rect{
-        .x = 0,
-        .y = 0,
-        .width = self.mode.hdisplay,
-        .height = self.mode.vdisplay,
-    });
+/// The offsets in [0, size) that land within [start, start + len) when
+/// counted from origin.
+fn span(origin: i64, start: u32, len: u32, size: usize) [2]usize {
+    const limit: i64 = @intCast(size);
+    const first = std.math.clamp(@as(i64, start) - origin, 0, limit);
+    const end = std.math.clamp(@as(i64, start) + len - origin, first, limit);
+    return .{ @intCast(first), @intCast(end) };
+}
 
-    if (clipped_rect.width == 0 or clipped_rect.height == 0) return;
-    for (clipped_rect.y..(clipped_rect.y + clipped_rect.height)) |h| {
-        @memset(pixels[framebuffer.stride * h + clipped_rect.x ..][0..clipped_rect.width], color);
+/// XRGB8888 pixels in rows of `stride`, drawn within width x height.
+const Canvas = struct {
+    pixels: []u32,
+    width: u32,
+    height: u32,
+    stride: usize,
+
+    fn bounds(self: Canvas) Rect {
+        return .{ .x = 0, .y = 0, .width = self.width, .height = self.height };
     }
-}
 
-pub fn clear(self: *Self, color: u32) void {
-    const framebuffer = self.framebuffers[self.render_index];
-    const pixels: [*]u32 = @ptrCast(@alignCast(framebuffer.map));
-    const pixel_count = framebuffer.size / @sizeOf(u32);
-    @memset(pixels[0..pixel_count], color);
-}
+    fn fillRect(self: Canvas, color: u32, rect: Rect) void {
+        const clipped = rect.clip(self.bounds());
+        if (clipped.width == 0 or clipped.height == 0) return;
+        for (clipped.y..clipped.y + clipped.height) |y| {
+            @memset(self.pixels[y * self.stride + clipped.x ..][0..clipped.width], color);
+        }
+    }
+
+    fn clear(self: Canvas, color: u32) void {
+        @memset(self.pixels, color);
+    }
+
+    /// Coverage glyphs take `color`; color glyphs keep their own pixels.
+    fn drawGlyph(self: Canvas, font: *const Font, glyph: *const Glyph, rect: Rect, offset_x: i32, offset_y: i32, color: u32) void {
+        const clipped = rect.clip(self.bounds());
+        const left = @as(i64, rect.x) + glyph.left + offset_x;
+        const top = @as(i64, rect.y) + font.ascender - glyph.top + offset_y;
+        const rows = span(top, clipped.y, clipped.height, glyph.rows);
+        const columns = span(left, clipped.x, clipped.width, glyph.width);
+        const count = columns[1] - columns[0];
+        if (count == 0) return;
+        for (rows[0]..rows[1]) |row| {
+            const y: usize = @intCast(top + @as(i64, @intCast(row)));
+            const x: usize = @intCast(left + @as(i64, @intCast(columns[0])));
+            const dest = self.pixels[y * self.stride + x ..][0..count];
+            const source = row * glyph.width + columns[0];
+            if (glyph.color) {
+                const bgras = std.mem.bytesAsSlice([4]u8, glyph.pixels[source * 4 ..][0 .. count * 4]);
+                for (dest, bgras) |*pixel, *bgra| {
+                    if (bgra[3] != 0) pixel.* = blendPremultiplied(pixel.*, bgra);
+                }
+            } else {
+                for (dest, glyph.pixels[source..][0..count]) |*pixel, alpha| {
+                    if (alpha == 0) continue;
+                    pixel.* = if (alpha == 255) color else blendPixel(pixel.*, color, alpha);
+                }
+            }
+        }
+    }
+
+    fn drawUnderline(self: Canvas, font: *const Font, style: ghosttyvt.Style, rect: Rect, color: u32) void {
+        if (style.flags.underline == .none or rect.height == 0) return;
+        const thickness = @min(font.underline_thickness, rect.height);
+        const offset = @min(font.underline_position, rect.height - thickness);
+        const y = rect.y + offset;
+        switch (style.flags.underline) {
+            .none => unreachable,
+            .single => self.fillRect(color, .{ .x = rect.x, .y = y, .width = rect.width, .height = thickness }),
+            .double => {
+                self.fillRect(color, .{ .x = rect.x, .y = y, .width = rect.width, .height = thickness });
+                self.fillRect(color, .{ .x = rect.x, .y = rect.y + (offset -| (2 * thickness)), .width = rect.width, .height = thickness });
+            },
+            .dotted, .dashed, .curly => {
+                // Use screen coordinates to keep patterns continuous between cells.
+                for (0..rect.width) |column| {
+                    const x = rect.x + @as(u32, @intCast(column));
+                    var line_y = y;
+                    switch (style.flags.underline) {
+                        .dotted => if (x % (2 * thickness) >= thickness) continue,
+                        .dashed => if (x % (6 * thickness) >= 4 * thickness) continue,
+                        .curly => {
+                            const amplitude = @min(2 * thickness, offset);
+                            const phase = x % (4 * thickness);
+                            const wave = if (phase <= 2 * thickness) phase else 4 * thickness - phase;
+                            line_y -= @min(wave, amplitude);
+                        },
+                        else => unreachable,
+                    }
+                    self.fillRect(color, .{ .x = x, .y = line_y, .width = 1, .height = thickness });
+                }
+            },
+        }
+    }
+
+    /// Draw the part of a placement inside clip, blending straight alpha.
+    fn drawImage(self: Canvas, image: Images.Visible, clip: Rect) void {
+        const g = image.geometry;
+        const x0 = @max(g.x, clip.x);
+        const x1 = @min(g.x + g.width, @as(i64, clip.x) + clip.width, self.width);
+        const y0 = @max(g.y, clip.y);
+        const y1 = @min(g.y + g.height, @as(i64, clip.y) + clip.height, self.height);
+        var y = y0;
+        while (y < y1) : (y += 1) {
+            const row = self.pixels[@as(usize, @intCast(y)) * self.stride ..];
+            const source = image.row(y);
+            var x = x0;
+            while (x < x1) : (x += 1) {
+                const rgba = image.pixel(source, x);
+                if (rgba[3] == 0) continue;
+                const color = (@as(u32, rgba[0]) << 16) | (@as(u32, rgba[1]) << 8) | rgba[2];
+                const pixel = &row[@intCast(x)];
+                pixel.* = if (rgba[3] == 255) color else blendPixel(pixel.*, color, rgba[3]);
+            }
+        }
+    }
+};
 
 fn blendPixel(bg: u32, fg: u32, alpha: u8) u32 {
     const inverse_alpha = 255 - alpha;
@@ -545,59 +658,38 @@ fn rgbPixel(rgb: ghosttyvt.color.RGB) u32 {
 
 const CellColors = struct { fg: u32, bg: u32 };
 
-fn defaultColors(term: *const ghosttyvt.Terminal) struct { fg: ghosttyvt.color.RGB, bg: ghosttyvt.color.RGB } {
-    var fg = term.colors.foreground.get() orelse Colors.foreground;
-    var bg = term.colors.background.get() orelse Colors.background;
-    // DECSCNM reverses defaults, not explicitly selected ANSI/RGB colors.
-    if (term.modes.get(.reverse_colors)) std.mem.swap(ghosttyvt.color.RGB, &fg, &bg);
-    return .{ .fg = fg, .bg = bg };
-}
+/// The default colors and palette that cell colors resolve against.
+const Theme = struct {
+    fg: ghosttyvt.color.RGB,
+    bg: ghosttyvt.color.RGB,
+    palette: *const ghosttyvt.color.Palette,
 
-fn cellColors(cell: ghosttyvt.Cell, style: ghosttyvt.Style, term: *const ghosttyvt.Terminal) CellColors {
-    const defaults = defaultColors(term);
-    const palette = &term.colors.palette.current;
+    fn of(term: *const ghosttyvt.Terminal) Theme {
+        var fg = term.colors.foreground.get() orelse Colors.foreground;
+        var bg = term.colors.background.get() orelse Colors.background;
+        // DECSCNM reverses defaults, not explicitly selected ANSI/RGB colors.
+        if (term.modes.get(.reverse_colors)) std.mem.swap(ghosttyvt.color.RGB, &fg, &bg);
+        return .{ .fg = fg, .bg = bg, .palette = &term.colors.palette.current };
+    }
+};
+
+fn cellColors(cell: ghosttyvt.Cell, style: ghosttyvt.Style, theme: Theme) CellColors {
     var colors: CellColors = .{
-        .fg = rgbPixel(style.fg(.{ .default = defaults.fg, .palette = palette, .bold = .bright })),
+        .fg = rgbPixel(style.fg(.{ .default = theme.fg, .palette = theme.palette, .bold = .bright })),
         // bg() also handles blank cells that store their background inline.
-        .bg = rgbPixel(style.bg(&cell, palette) orelse defaults.bg),
+        .bg = rgbPixel(style.bg(&cell, theme.palette) orelse theme.bg),
     };
     if (style.flags.inverse) std.mem.swap(u32, &colors.fg, &colors.bg);
     if (style.flags.faint) colors.fg = blendPixel(colors.bg, colors.fg, 128);
     return colors;
 }
 
-fn drawUnderline(self: *Self, font: *const Font, style: ghosttyvt.Style, rect: Rect, color: u32) void {
-    if (style.flags.underline == .none or rect.height == 0) return;
-    const thickness = @min(font.underline_thickness, rect.height);
-    const offset = @min(font.underline_position, rect.height - thickness);
-    const y = rect.y + offset;
-    switch (style.flags.underline) {
-        .none => unreachable,
-        .single => self.fill_rect(color, .{ .x = rect.x, .y = y, .width = rect.width, .height = thickness }),
-        .double => {
-            self.fill_rect(color, .{ .x = rect.x, .y = y, .width = rect.width, .height = thickness });
-            self.fill_rect(color, .{ .x = rect.x, .y = rect.y + (offset -| (2 * thickness)), .width = rect.width, .height = thickness });
-        },
-        .dotted, .dashed, .curly => {
-            // Use screen coordinates to keep patterns continuous between cells.
-            for (0..rect.width) |column| {
-                const x = rect.x + @as(u32, @intCast(column));
-                var line_y = y;
-                switch (style.flags.underline) {
-                    .dotted => if (x % (2 * thickness) >= thickness) continue,
-                    .dashed => if (x % (6 * thickness) >= 4 * thickness) continue,
-                    .curly => {
-                        const amplitude = @min(2 * thickness, offset);
-                        const phase = x % (4 * thickness);
-                        const wave = if (phase <= 2 * thickness) phase else 4 * thickness - phase;
-                        line_y -= @min(wave, amplitude);
-                    },
-                    else => unreachable,
-                }
-                self.fill_rect(color, .{ .x = x, .y = line_y, .width = 1, .height = thickness });
-            }
-        },
-    }
+/// Whether a cell has the default style and no background of its own.
+fn plain(cell: ghosttyvt.Cell) bool {
+    return !cell.hasStyling() and switch (cell.content_tag) {
+        .codepoint, .codepoint_grapheme => true,
+        .bg_color_palette, .bg_color_rgb => false,
+    };
 }
 
 /// Composite premultiplied BGRA over an XRGB pixel.
@@ -622,38 +714,11 @@ fn drawCell(self: *Self, font: *Font, pin: ghosttyvt.Pin, cell: *const ghosttyvt
     const extra: []const u21 = if (cell.hasGrapheme()) pin.grapheme(cell) orelse &.{} else &.{};
     const cells = cell.gridWidth();
     if (extra.len == 0) {
-        if (codepoint != ' ') self.drawGlyph(font, try font.glyph(glyphKey(codepoint, style, cells)), rect, 0, 0, color);
+        if (codepoint != ' ') self.shadow.drawGlyph(font, try font.glyph(glyphKey(codepoint, style, cells)), rect, 0, 0, color);
         return;
     }
     for (try font.shape(codepoint, extra, style, cells)) |placed| {
-        self.drawGlyph(font, try font.glyph(placed.key), rect, placed.x, placed.y, color);
-    }
-}
-
-/// Coverage glyphs take `color`; color glyphs keep their own pixels.
-fn drawGlyph(self: *Self, font: *const Font, glyph: *const Glyph, rect: Rect, offset_x: i32, offset_y: i32, color: u32) void {
-    const clipped = rect.clip(.{ .x = 0, .y = 0, .width = self.mode.hdisplay, .height = self.mode.vdisplay });
-    const framebuffer = self.framebuffers[self.render_index];
-    const pixels: [*]u32 = @ptrCast(@alignCast(framebuffer.map));
-
-    for (0..glyph.rows) |row| {
-        const y = @as(i64, rect.y) + font.ascender - glyph.top + offset_y + @as(i64, @intCast(row));
-        if (y < clipped.y or y >= @as(i64, clipped.y) + clipped.height) continue;
-        for (0..glyph.width) |column| {
-            const x = @as(i64, rect.x) + glyph.left + offset_x + @as(i64, @intCast(column));
-            if (x < clipped.x or x >= @as(i64, clipped.x) + clipped.width) continue;
-            const index = @as(usize, @intCast(y)) * framebuffer.stride + @as(usize, @intCast(x));
-            const offset = row * glyph.width + column;
-            if (glyph.color) {
-                const bgra = glyph.pixels[offset * 4 ..][0..4];
-                if (bgra[3] == 0) continue;
-                pixels[index] = blendPremultiplied(pixels[index], bgra);
-            } else {
-                const alpha = glyph.pixels[offset];
-                if (alpha == 0) continue;
-                pixels[index] = if (alpha == 255) color else blendPixel(pixels[index], color, alpha);
-            }
-        }
+        self.shadow.drawGlyph(font, try font.glyph(placed.key), rect, placed.x, placed.y, color);
     }
 }
 
@@ -673,8 +738,8 @@ fn cursorRow(screen: *ghosttyvt.Screen) ?u16 {
 pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
     if (self.flip_pending) return error.PageFlipPending;
     const screen = term.screens.active;
-    const defaults = defaultColors(term);
-    const default_bg = rgbPixel(defaults.bg);
+    const theme: Theme = .of(term);
+    const default_bg = rgbPixel(theme.bg);
     const key: RenderKey = .{
         .screen = @intFromPtr(screen),
         .cols = screen.pages.cols,
@@ -684,7 +749,7 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
         .cell_width = font.cell_width,
         .cell_height = font.cell_height,
         .ascender = font.ascender,
-        .fg = rgbPixel(defaults.fg),
+        .fg = rgbPixel(theme.fg),
         .bg = default_bg,
     };
     const cursor_row = cursorRow(screen);
@@ -710,17 +775,30 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
         if (cursor.visible) self.damage.mark(cursor.y);
     }
 
-    // Consume source damage only after recording it for BOTH buffers. Pins
+    // Source damage is consumed as soon as it is recorded in self.damage,
+    // which keeps it until the shadow and both framebuffers are updated. Pins
     // and serials detect rows moved/recycled by scrolling, including viewport
     // scrolling, without dereferencing any saved page pointer.
+    term.flags.dirty = .{};
+    screen.dirty = .{};
     var scan = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
     var row_index: usize = 0;
+    var page_node: usize = 0;
+    var page_dirty = false;
     while (scan.next()) |pin| : (row_index += 1) {
         if (row_index >= self.damage.rows.items.len) break;
         const row = &self.damage.rows.items[row_index];
         const node = @intFromPtr(pin.node);
+        // A page's flag covers all its rows, so clear it once per page.
+        if (node != page_node) {
+            page_node = node;
+            page_dirty = pin.node.page().dirty;
+            pin.node.page().dirty = false;
+        }
+        const source = pin.rowAndCell().row;
         if (row.node != node or row.serial != pin.node.serial or row.page_y != pin.y or
-            pin.node.page().dirty or pin.rowAndCell().row.dirty) self.damage.mark(row_index);
+            page_dirty or source.dirty) self.damage.mark(row_index);
+        source.dirty = false;
         row.node = node;
         row.serial = pin.node.serial;
         row.page_y = pin.y;
@@ -737,11 +815,10 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
         for (self.previous_images.items) |image| self.markImageRows(image.geometry, font.cell_height);
         for (self.images.items) |image| self.markImageRows(image.geometry, font.cell_height);
     }
-    const grid_width: u32 = @intCast(@min(@as(u64, screen.pages.cols) * font.cell_width, self.mode.hdisplay));
+    const canvas = self.shadow;
+    const grid_width: u32 = @intCast(@min(@as(u64, screen.pages.cols) * font.cell_width, canvas.width));
 
-    const full = self.damage.full[self.render_index];
-    var changed = full;
-    if (full) self.clear(default_bg);
+    if (self.damage.clear) canvas.clear(default_bg);
     var rows = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
     var y: u32 = 0;
     row_index = 0;
@@ -750,30 +827,31 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
         y += font.cell_height;
         row_index += 1;
     }) {
-        if (y >= self.mode.vdisplay or row_index >= self.damage.rows.items.len) break;
-        if (!self.damage.rows.items[row_index].pending[self.render_index]) continue;
-        changed = true;
+        if (y >= canvas.height or row_index >= self.damage.rows.items.len) break;
+        if (!self.damage.rows.items[row_index].stale) continue;
         if (cursor.visible and row_index == cursor.y) redraw_cursor = true;
-        if (!full) self.fill_rect(default_bg, .{ .x = 0, .y = y, .width = self.mode.hdisplay, .height = font.cell_height });
+        if (!self.damage.clear) canvas.fillRect(default_bg, .{ .x = 0, .y = y, .width = canvas.width, .height = font.cell_height });
         const strip: Rect = .{ .x = 0, .y = y, .width = grid_width, .height = font.cell_height };
         self.drawImages(.below_background, strip);
         const cells = pin.cells(.all);
         // Paint backgrounds first so the trailing spacer never erases a wide glyph.
         for (cells, 0..) |*cell, column| {
             const x = @as(u64, column) * font.cell_width;
-            if (x >= self.mode.hdisplay) break;
-            const colors = cellColors(cell.*, pin.style(cell), term);
+            if (x >= canvas.width) break;
+            if (plain(cell.*)) continue;
+            const colors = cellColors(cell.*, pin.style(cell), theme);
             if (colors.bg != default_bg)
-                self.fill_rect(colors.bg, .{ .x = @intCast(x), .y = y, .width = font.cell_width, .height = font.cell_height });
+                canvas.fillRect(colors.bg, .{ .x = @intCast(x), .y = y, .width = font.cell_width, .height = font.cell_height });
         }
         self.drawImages(.below_text, strip);
         for (cells, 0..) |*cell, column| {
             const x = @as(u64, column) * font.cell_width;
-            if (x >= self.mode.hdisplay) break;
+            if (x >= canvas.width) break;
             if (cell.wide == .spacer_head or cell.wide == .spacer_tail) continue;
             const style = pin.style(cell);
-            if (style.flags.invisible) continue;
-            const colors = cellColors(cell.*, style, term);
+            const glyphless = cell.codepoint() == 0 or (cell.codepoint() == ' ' and !cell.hasGrapheme());
+            if (style.flags.invisible or (glyphless and style.flags.underline == .none)) continue;
+            const colors = cellColors(cell.*, style, theme);
             const rect: Rect = .{
                 .x = @intCast(x),
                 .y = y,
@@ -781,8 +859,8 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
                 .height = font.cell_height,
             };
             try self.drawCell(font, pin, cell, FontStyle.fromCell(style), rect, colors.fg);
-            const underline_color = if (style.underlineColor(&term.colors.palette.current)) |rgb| rgbPixel(rgb) else colors.fg;
-            self.drawUnderline(font, style, rect, underline_color);
+            const underline_color = if (style.underlineColor(theme.palette)) |rgb| rgbPixel(rgb) else colors.fg;
+            canvas.drawUnderline(font, style, rect, underline_color);
         }
         self.drawImages(.above_text, strip);
     }
@@ -790,19 +868,33 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
     if (redraw_cursor) try self.drawCursor(font, term, cursor.y);
 
     // Keep accumulated damage intact if any drawing operation failed.
-    for (self.damage.rows.items) |*row| row.pending[self.render_index] = false;
-    self.damage.full[self.render_index] = false;
+    for (self.damage.rows.items) |*row| row.stale = false;
+    self.damage.clear = false;
     self.damage.key = key;
     self.damage.cursor = cursor;
-    term.flags.dirty = .{};
-    screen.dirty = .{};
-    var clean = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
-    row_index = 0;
-    while (clean.next()) |pin| : (row_index += 1) {
-        if (row_index >= self.damage.rows.items.len) break;
-        pin.rowAndCell().row.dirty = false;
-        pin.node.page().dirty = false;
+    return self.copyDamage(font.cell_height);
+}
+
+/// Copy the shadow's rows that the back buffer lacks. Returns false when
+/// it was already current.
+fn copyDamage(self: *Self, cell_height: u32) bool {
+    const index = self.render_index;
+    const target: [*]u32 = @ptrCast(@alignCast(self.framebuffers[index].map));
+    const source = self.shadow.pixels;
+    const full = self.damage.full[index];
+    if (full) @memcpy(target[0..source.len], source);
+    var changed = full;
+    for (self.damage.rows.items, 0..) |*row, row_index| {
+        if (!row.pending[index]) continue;
+        row.pending[index] = false;
+        changed = true;
+        if (full) continue;
+        const top = @min(row_index * cell_height, self.shadow.height);
+        const bottom = @min(top + cell_height, self.shadow.height);
+        const pixels = source[top * self.shadow.stride .. bottom * self.shadow.stride];
+        @memcpy(target[top * self.shadow.stride ..][0..pixels.len], pixels);
     }
+    self.damage.full[index] = false;
     return changed;
 }
 
@@ -816,30 +908,7 @@ fn markImageRows(self: *Self, geometry: Images.Geometry, cell_height: u32) void 
 
 fn drawImages(self: *Self, layer: Images.Layer, clip: Rect) void {
     for (self.images.items) |image| {
-        if (Images.layer(image.geometry.z) == layer) self.drawImage(image, clip);
-    }
-}
-
-/// Draw the part of a placement inside clip, blending straight alpha.
-fn drawImage(self: *Self, image: Images.Visible, clip: Rect) void {
-    const g = image.geometry;
-    const framebuffer = self.framebuffers[self.render_index];
-    const pixels: [*]u32 = @ptrCast(@alignCast(framebuffer.map));
-    const x0 = @max(g.x, clip.x);
-    const x1 = @min(g.x + g.width, @as(i64, clip.x) + clip.width, self.mode.hdisplay);
-    const y0 = @max(g.y, clip.y);
-    const y1 = @min(g.y + g.height, @as(i64, clip.y) + clip.height, self.mode.vdisplay);
-    var y = y0;
-    while (y < y1) : (y += 1) {
-        const row = pixels[@as(usize, @intCast(y)) * framebuffer.stride ..];
-        var x = x0;
-        while (x < x1) : (x += 1) {
-            const rgba = image.sample(x, y);
-            if (rgba[3] == 0) continue;
-            const color = (@as(u32, rgba[0]) << 16) | (@as(u32, rgba[1]) << 8) | rgba[2];
-            const pixel = &row[@intCast(x)];
-            pixel.* = if (rgba[3] == 255) color else blendPixel(pixel.*, color, rgba[3]);
-        }
+        if (Images.layer(image.geometry.z) == layer) self.shadow.drawImage(image, clip);
     }
 }
 
@@ -857,7 +926,7 @@ fn drawCursor(self: *Self, font: *Font, term: *ghosttyvt.Terminal, row: u16) !vo
     const cursor_y = @as(u64, row) * font.cell_height;
     if (x >= self.mode.hdisplay or cursor_y >= self.mode.vdisplay) return;
     const style = cursor_pin.style(cell);
-    const colors = cellColors(cell.*, style, term);
+    const colors = cellColors(cell.*, style, .of(term));
     const cursor_color = if (term.colors.cursor.get()) |rgb| rgbPixel(rgb) else colors.fg;
     const rect: Rect = .{
         .x = @intCast(x),
@@ -865,95 +934,23 @@ fn drawCursor(self: *Self, font: *Font, term: *ghosttyvt.Terminal, row: u16) !vo
         .width = font.cell_width *| @as(u32, cell.gridWidth()),
         .height = font.cell_height,
     };
+    const canvas = self.shadow;
     switch (screen.cursor.cursor_style) {
         .block => {
-            self.fill_rect(cursor_color, rect);
+            canvas.fillRect(cursor_color, rect);
             if (!style.flags.invisible) {
                 try self.drawCell(font, cursor_pin, cell, FontStyle.fromCell(style), rect, colors.bg);
-                self.drawUnderline(font, style, rect, colors.bg);
+                canvas.drawUnderline(font, style, rect, colors.bg);
             }
         },
-        .bar => self.fill_rect(cursor_color, .{ .x = rect.x, .y = rect.y, .width = @min(2, rect.width), .height = rect.height }),
-        .underline => self.fill_rect(cursor_color, .{ .x = rect.x, .y = rect.y + rect.height - @min(2, rect.height), .width = rect.width, .height = @min(2, rect.height) }),
+        .bar => canvas.fillRect(cursor_color, .{ .x = rect.x, .y = rect.y, .width = @min(2, rect.width), .height = rect.height }),
+        .underline => canvas.fillRect(cursor_color, .{ .x = rect.x, .y = rect.y + rect.height - @min(2, rect.height), .width = rect.width, .height = @min(2, rect.height) }),
         .block_hollow => {
-            self.fill_rect(cursor_color, .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = 1 });
-            self.fill_rect(cursor_color, .{ .x = rect.x, .y = rect.y + rect.height - 1, .width = rect.width, .height = 1 });
-            self.fill_rect(cursor_color, .{ .x = rect.x, .y = rect.y, .width = 1, .height = rect.height });
-            self.fill_rect(cursor_color, .{ .x = rect.x + rect.width - 1, .y = rect.y, .width = 1, .height = rect.height });
+            canvas.fillRect(cursor_color, .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = 1 });
+            canvas.fillRect(cursor_color, .{ .x = rect.x, .y = rect.y + rect.height - 1, .width = rect.width, .height = 1 });
+            canvas.fillRect(cursor_color, .{ .x = rect.x, .y = rect.y, .width = 1, .height = rect.height });
+            canvas.fillRect(cursor_color, .{ .x = rect.x + rect.width - 1, .y = rect.y, .width = 1, .height = rect.height });
         },
-    }
-}
-
-/// Rasterize UTF-8 text with FreeType into the current back buffer.
-/// `baseline_y` specifies the baseline of the first line in screen pixels.
-pub fn drawText(
-    self: *Self,
-    font_path: [*:0]const u8,
-    text: [*:0]const u8,
-    pixel_size: u32,
-    x: i32,
-    baseline_y: i32,
-    color: u32,
-) !void {
-    const framebuffer = self.framebuffers[self.render_index];
-    const pixels: [*]u32 = @ptrCast(@alignCast(framebuffer.map));
-    const height = self.mode.vdisplay;
-    const width = self.mode.hdisplay;
-    const stride: u32 = @intCast(framebuffer.stride);
-
-    var library: freetype.FT_Library = undefined;
-    var face: freetype.FT_Face = undefined;
-    if (freetype.FT_Init_FreeType(&library) != 0) return error.FailedToInitializeFreeType;
-    defer _ = freetype.FT_Done_FreeType(library);
-
-    if (freetype.FT_New_Face(library, font_path, 0, &face) != 0) return error.FailedToLoadTypeface;
-    defer _ = freetype.FT_Done_Face(face);
-
-    if (freetype.FT_Set_Pixel_Sizes(face, 0, pixel_size) != 0) return error.FailedToSetPixelSizes;
-
-    var pen_x = x;
-    var pen_y = baseline_y;
-
-    var utf8_view = std.unicode.Utf8View.init(std.mem.span(text)) catch return error.InvalidUtf8;
-    var iter = utf8_view.iterator();
-
-    while (iter.nextCodepoint()) |codepoint| {
-        if (codepoint == '\n') {
-            pen_x = x;
-
-            pen_y += @as(i32, @intCast(face.*.size.*.metrics.height >> 6));
-            continue;
-        }
-
-        if (freetype.FT_Load_Char(face, codepoint, freetype.FT_LOAD_RENDER) != 0) {
-            return error.GlyphLoadFailed;
-        }
-
-        const glyph = face.*.glyph;
-        const bitmap = &glyph.*.bitmap;
-
-        var row: u32 = 0;
-        while (row < bitmap.*.rows) : (row += 1) {
-            const destination_y = pen_y - glyph.*.bitmap_top + @as(i32, @intCast(row));
-
-            if (destination_y < 0 or destination_y >= height) continue;
-
-            var column: u32 = 0;
-            while (column < bitmap.*.width) : (column += 1) {
-                const destination_x = pen_x + glyph.*.bitmap_left + @as(i32, @intCast(column));
-
-                if (destination_x < 0 or destination_x >= width) continue;
-
-                const buffer_idx = row * @as(u32, @intCast(bitmap.*.pitch)) + column;
-                const alpha = bitmap.*.buffer[buffer_idx];
-
-                const dest_idx = @as(u32, @intCast(destination_y)) * stride + @as(u32, @intCast(destination_x));
-
-                pixels[dest_idx] = blendPixel(pixels[dest_idx], color, alpha);
-            }
-        }
-
-        pen_x += @as(i32, @intCast(glyph.*.advance.x >> 6));
     }
 }
 
@@ -969,7 +966,7 @@ pub fn present(self: *Self) !void {
             framebuffer.id,
             0,
             0,
-            &self.device.connector.connector_id,
+            &self.device.connector_id,
             1,
             &self.mode,
         ) != 0) {
@@ -1016,13 +1013,13 @@ pub fn deactivate(self: *Self) void {
 }
 
 /// Resume once the seat provider has restored DRM master. The next present
-/// modesets and the next draw repaints everything, since another master
+/// modesets and the next draw copies the whole frame, since another master
 /// owned the CRTC.
 pub fn activate(self: *Self) !void {
     if (libdrm.drmIsMaster(self.fd) != 1) return error.DrmMasterUnavailable;
     self.active = true;
     self.display_index = null;
-    self.damage.invalidate();
+    self.damage.full = .{ true, true };
 }
 
 pub fn frameIntervalNs(self: *const Self) u64 {
@@ -1046,10 +1043,16 @@ fn page_flip_handler(
     self.completeFlip();
 }
 
-pub fn deinit(self: *Self) void {
+/// Free the state used to draw frames, which owns no DRM objects.
+fn deinitDrawing(self: *Self) void {
+    self.allocator.free(self.shadow.pixels);
     self.damage.deinit(self.allocator);
     self.images.deinit(self.allocator);
     self.previous_images.deinit(self.allocator);
+}
+
+pub fn deinit(self: *Self) void {
+    self.deinitDrawing();
     // Normal shell exit already drains flips. Signals and error exits may not.
     if (self.flip_pending) self.finishPendingFlip();
     // While switched away, the display belongs to the active VT.
@@ -1082,7 +1085,7 @@ fn restoreCrtc(self: *Self) void {
             saved_crtc.*.buffer_id,
             saved_crtc.*.x,
             saved_crtc.*.y,
-            if (saved_crtc.*.mode_valid != 0) &self.device.connector.connector_id else null,
+            if (saved_crtc.*.mode_valid != 0) &self.device.connector_id else null,
             if (saved_crtc.*.mode_valid != 0) 1 else 0,
             if (saved_crtc.*.mode_valid != 0) &saved_crtc.*.mode else null,
         );
@@ -1099,7 +1102,8 @@ fn restoreCrtc(self: *Self) void {
     std.log.warn("Could not restore CRTC {d} after retrying", .{saved_crtc.*.crtc_id});
 }
 
-fn testRenderer(pixels: []u32, width: u16, height: u16, stride: usize) Self {
+/// Free with deinitDrawing.
+fn testRenderer(pixels: []u32, width: u16, height: u16, stride: usize) !Self {
     const framebuffer = Framebuffer{ .id = 0, .handle = 0, .map = pixels.ptr, .size = pixels.len * @sizeOf(u32), .stride = stride };
     var mode = std.mem.zeroes(libdrm.drmModeModeInfo);
     mode.hdisplay = width;
@@ -1110,6 +1114,12 @@ fn testRenderer(pixels: []u32, width: u16, height: u16, stride: usize) Self {
         .device = undefined,
         .mode = mode,
         .framebuffers = .{ framebuffer, framebuffer },
+        .shadow = .{
+            .pixels = try std.testing.allocator.alloc(u32, stride * height),
+            .width = width,
+            .height = height,
+            .stride = stride,
+        },
         .saved_crtc = null,
     };
 }
@@ -1230,15 +1240,35 @@ test "color glyphs copy BGRA rows and resample by area" {
     try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, enlarged.pixels[60..64]);
 }
 
-test "framebuffer fills clip rectangles and respect padded stride" {
+test "canvas fills clip rectangles and respect padded stride" {
     var pixels = [_]u32{99} ** 12;
-    var renderer = testRenderer(&pixels, 3, 3, 4);
-    renderer.clear(0x123456);
+    const canvas: Canvas = .{ .pixels = &pixels, .width = 3, .height = 3, .stride = 4 };
+    canvas.clear(0x123456);
     try std.testing.expectEqualSlices(u32, &([_]u32{0x123456} ** 12), &pixels);
-    renderer.fill_rect(7, .{ .x = 1, .y = 1, .width = 20, .height = 20 });
+    canvas.fillRect(7, .{ .x = 1, .y = 1, .width = 20, .height = 20 });
     try std.testing.expectEqualSlices(u32, &.{ 0x123456, 0x123456, 0x123456, 0x123456, 0x123456, 7, 7, 0x123456, 0x123456, 7, 7, 0x123456 }, &pixels);
-    renderer.fill_rect(8, .{ .x = 10, .y = 10, .width = 2, .height = 2 });
+    canvas.fillRect(8, .{ .x = 10, .y = 10, .width = 2, .height = 2 });
     try std.testing.expectEqual(@as(u32, 7), pixels[10]);
+}
+
+test "glyphs clip to their rect and the canvas on every side" {
+    var pixels = [_]u32{0} ** 20;
+    const canvas: Canvas = .{ .pixels = &pixels, .width = 4, .height = 4, .stride = 5 };
+    var font = testFont();
+    var coverage = [_]u8{255} ** 9;
+    const glyph: Glyph = .{ .pixels = &coverage, .width = 3, .rows = 3, .left = -1, .top = 1 };
+    // Overhangs the rect's top-left corner, so only its bottom-right 2x2 lands.
+    canvas.drawGlyph(&font, &glyph, .{ .x = 0, .y = 0, .width = 4, .height = 4 }, 0, 0, 7);
+    try std.testing.expectEqualSlices(u32, &.{ 7, 7, 0, 0, 0, 7, 7, 0, 0, 0 }, pixels[0..10]);
+    // Past the canvas's bottom-right corner, and entirely outside it.
+    @memset(&pixels, 0);
+    canvas.drawGlyph(&font, &glyph, .{ .x = 3, .y = 3, .width = 4, .height = 4 }, 1, 1, 7);
+    try std.testing.expectEqual(@as(u32, 7), pixels[3 * 5 + 3]);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, &pixels, &.{7}));
+    @memset(&pixels, 0);
+    canvas.drawGlyph(&font, &glyph, .{ .x = 3, .y = 3, .width = 4, .height = 4 }, 5, 5, 7);
+    canvas.drawGlyph(&font, &glyph, .{ .x = 0, .y = 0, .width = 4, .height = 4 }, -5, -5, 7);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u32, &pixels, &.{7}));
 }
 
 test "cached glyphs render with backgrounds, reverse colors and transparent pixels" {
@@ -1265,8 +1295,8 @@ test "cached glyphs render with backgrounds, reverse colors and transparent pixe
     defer stream.deinit();
     stream.nextSlice("\x1b[?25lA\x1b[41m \x1b[0m");
     var pixels = [_]u32{99} ** 8;
-    var renderer = testRenderer(&pixels, 6, 1, 8);
-    defer renderer.damage.deinit(renderer.allocator);
+    var renderer = try testRenderer(&pixels, 6, 1, 8);
+    defer renderer.deinitDrawing();
     _ = try renderer.drawTerminal(&font, &term);
     const red = rgbPixel(term.colors.palette.current[1]);
     const fg = rgbPixel(Colors.foreground);
@@ -1298,8 +1328,8 @@ test "SGR font styles and block cursor use the matching cached face" {
     defer stream.deinit();
     stream.nextSlice("\x1b[?25lA\x1b[1mA\x1b[22;3mA\x1b[1;4mA\x1b[0mA");
     var pixels = [_]u32{99} ** 80;
-    var renderer = testRenderer(&pixels, 20, 4, 20);
-    defer renderer.damage.deinit(allocator);
+    var renderer = try testRenderer(&pixels, 20, 4, 20);
+    defer renderer.deinitDrawing();
     _ = try renderer.drawTerminal(&font, &term);
     const fg = rgbPixel(Colors.foreground);
     const bg = rgbPixel(Colors.background);
@@ -1314,13 +1344,13 @@ test "SGR font styles and block cursor use the matching cached face" {
     try std.testing.expectEqualSlices(u32, &([_]u32{bg} ** 4), pixels[72..76]);
 }
 
-test "underline patterns stay within the cell and preserve framebuffer padding" {
+test "underline patterns stay within the cell and preserve canvas padding" {
     var font = testFont();
     font.cell_width = 24;
     font.cell_height = 6;
     font.underline_position = 4;
     var pixels = [_]u32{99} ** (26 * 6);
-    var renderer = testRenderer(&pixels, 24, 6, 26);
+    const canvas: Canvas = .{ .pixels = &pixels, .width = 24, .height = 6, .stride = 26 };
     const cases = .{
         .{ ghosttyvt.Style{ .flags = .{ .underline = .single } }, 24 },
         .{ ghosttyvt.Style{ .flags = .{ .underline = .double } }, 48 },
@@ -1330,7 +1360,7 @@ test "underline patterns stay within the cell and preserve framebuffer padding" 
     };
     inline for (cases) |case| {
         @memset(&pixels, 99);
-        renderer.drawUnderline(&font, case[0], .{ .x = 0, .y = 0, .width = 24, .height = 6 }, 7);
+        canvas.drawUnderline(&font, case[0], .{ .x = 0, .y = 0, .width = 24, .height = 6 }, 7);
         var painted: usize = 0;
         for (0..6) |y| {
             for (0..24) |x| {
@@ -1347,7 +1377,7 @@ test "underline patterns stay within the cell and preserve framebuffer padding" 
     // A clipped, one-pixel-high cell must still get a visible underline.
     font.underline_thickness = 3;
     @memset(&pixels, 99);
-    renderer.drawUnderline(&font, .{ .flags = .{ .underline = .single } }, .{ .x = 23, .y = 5, .width = 4, .height = 1 }, 7);
+    canvas.drawUnderline(&font, .{ .flags = .{ .underline = .single } }, .{ .x = 23, .y = 5, .width = 4, .height = 1 }, 7);
     try std.testing.expectEqual(@as(u32, 7), pixels[5 * 26 + 23]);
     try std.testing.expectEqual(@as(u32, 99), pixels[5 * 26 + 24]);
 }
@@ -1368,8 +1398,8 @@ test "underlines cover spaces and wide cells with colors, resets and invisibilit
     defer stream.deinit();
     stream.nextSlice("\x1b[?25l\x1b[4m \x1b[58;2;18;52;86m \x1b[24m \x1b[4;8m \x1b[28;59m界\x1b[24m ");
     var pixels = [_]u32{99} ** 56;
-    var renderer = testRenderer(&pixels, 14, 4, 14);
-    defer renderer.damage.deinit(allocator);
+    var renderer = try testRenderer(&pixels, 14, 4, 14);
+    defer renderer.deinitDrawing();
     _ = try renderer.drawTerminal(&font, &term);
     const fg = rgbPixel(Colors.foreground);
     const bg = rgbPixel(Colors.background);
@@ -1461,8 +1491,8 @@ test "emoji sequences render as one color glyph within their cells" {
     const width = cols * font.cell_width;
     const pixels = try allocator.alloc(u32, width * font.cell_height);
     defer allocator.free(pixels);
-    var renderer = testRenderer(pixels, @intCast(width), @intCast(font.cell_height), width);
-    defer renderer.damage.deinit(allocator);
+    var renderer = try testRenderer(pixels, @intCast(width), @intCast(font.cell_height), width);
+    defer renderer.deinitDrawing();
     _ = try renderer.drawTerminal(&font, &term);
     var colored: usize = 0;
     for (pixels) |pixel| {
@@ -1485,8 +1515,8 @@ test "box drawing fills whole cells so lines join across rows and columns" {
     defer stream.deinit();
     stream.nextSlice("\x1b[?25l┌─┐\r\n│ │\r\n└─┘");
     var pixels = [_]u32{0} ** (15 * 21);
-    var renderer = testRenderer(&pixels, 15, 21, 15);
-    defer renderer.damage.deinit(allocator);
+    var renderer = try testRenderer(&pixels, 15, 21, 15);
+    defer renderer.deinitDrawing();
     _ = try renderer.drawTerminal(&font, &term);
     const fg = rgbPixel(Colors.foreground);
     // Each cell's light lines sit on row 3 and column 2 of the cell.
@@ -1545,9 +1575,9 @@ test "dirty rows leave clean pixels untouched and accumulate across both buffers
     defer stream.deinit();
     stream.nextSlice("\x1b[?25l");
     var pixels = [_][24]u32{[_]u32{99} ** 24} ** 2;
-    var renderer = testRenderer(&pixels[0], 4, 4, 6);
+    var renderer = try testRenderer(&pixels[0], 4, 4, 6);
     renderer.framebuffers[1].map = &pixels[1];
-    defer renderer.damage.deinit(allocator);
+    defer renderer.deinitDrawing();
     // Initialize both back buffers, just as successive page flips would.
     try std.testing.expect(try renderer.drawTerminal(&font, &term));
     renderer.completeFlip();
@@ -1596,11 +1626,11 @@ test "incremental frames match full redraws through cursor, color, screen and sc
     defer stream.deinit();
     var pixels = [_][24]u32{[_]u32{99} ** 24} ** 2;
     var expected = [_]u32{99} ** 24;
-    var renderer = testRenderer(&pixels[0], 4, 4, 6);
+    var renderer = try testRenderer(&pixels[0], 4, 4, 6);
     renderer.framebuffers[1].map = &pixels[1];
-    defer renderer.damage.deinit(allocator);
-    var reference = testRenderer(&expected, 4, 4, 6);
-    defer reference.damage.deinit(allocator);
+    defer renderer.deinitDrawing();
+    var reference = try testRenderer(&expected, 4, 4, 6);
+    defer reference.deinitDrawing();
     const updates = [_][]const u8{
         "\x1b[?25l",
         "\x1b[41m \x1b[0m",
@@ -1657,11 +1687,11 @@ test "scrolled viewports render history and hide an off-screen cursor" {
     defer stream.deinit();
     var pixels = [_][9]u32{[_]u32{99} ** 9} ** 2;
     var expected = [_]u32{99} ** 9;
-    var renderer = testRenderer(&pixels[0], 3, 3, 3);
+    var renderer = try testRenderer(&pixels[0], 3, 3, 3);
     renderer.framebuffers[1].map = &pixels[1];
-    defer renderer.damage.deinit(allocator);
-    var reference = testRenderer(&expected, 3, 3, 3);
-    defer reference.damage.deinit(allocator);
+    defer renderer.deinitDrawing();
+    var reference = try testRenderer(&expected, 3, 3, 3);
+    defer reference.deinitDrawing();
 
     const Step = union(enum) { output: []const u8, scroll: ghosttyvt.Terminal.ScrollViewport };
     const steps = [_]Step{
@@ -1715,15 +1745,11 @@ test "kitty images draw in z layers and incremental frames match full redraws" {
     defer stream.deinit();
     var pixels = [_][12]u32{[_]u32{99} ** 12} ** 2;
     var expected = [_]u32{99} ** 12;
-    var renderer = testRenderer(&pixels[0], 4, 3, 4);
+    var renderer = try testRenderer(&pixels[0], 4, 3, 4);
     renderer.framebuffers[1].map = &pixels[1];
-    defer renderer.damage.deinit(allocator);
-    defer renderer.images.deinit(allocator);
-    defer renderer.previous_images.deinit(allocator);
-    var reference = testRenderer(&expected, 4, 3, 4);
-    defer reference.damage.deinit(allocator);
-    defer reference.images.deinit(allocator);
-    defer reference.previous_images.deinit(allocator);
+    defer renderer.deinitDrawing();
+    var reference = try testRenderer(&expected, 4, 3, 4);
+    defer reference.deinitDrawing();
 
     // A 2x2 RGB image, one pixel per cell: red, green / blue, white.
     const rgb = [_]u8{ 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255 };
@@ -1782,9 +1808,9 @@ test "pending flips retain source damage and wide cursor moves erase the old row
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     var pixels = [_][9]u32{[_]u32{99} ** 9} ** 2;
-    var renderer = testRenderer(&pixels[0], 3, 3, 3);
+    var renderer = try testRenderer(&pixels[0], 3, 3, 3);
     renderer.framebuffers[1].map = &pixels[1];
-    defer renderer.damage.deinit(allocator);
+    defer renderer.deinitDrawing();
     stream.nextSlice("\x1b[?25l界\x1b[1;2H\x1b[?25h");
     _ = try renderer.drawTerminal(&font, &term);
     renderer.flip_pending = true;
@@ -1813,26 +1839,31 @@ test "failed row drawing retains damage until a successful retry" {
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     var pixels = [_][9]u32{[_]u32{99} ** 9} ** 2;
-    var renderer = testRenderer(&pixels[0], 3, 3, 3);
+    var renderer = try testRenderer(&pixels[0], 3, 3, 3);
     renderer.framebuffers[1].map = &pixels[1];
-    defer renderer.damage.deinit(allocator);
+    defer renderer.deinitDrawing();
     stream.nextSlice("\x1b[?25l");
     _ = try renderer.drawTerminal(&font, &term);
     renderer.completeFlip();
     _ = try renderer.drawTerminal(&font, &term);
     renderer.completeFlip();
     stream.nextSlice("\x1b[2;1HA");
+    pixels[0][3] = 0xDEADBEEF;
     // An uncached glyph on this synthetic font has no FreeType face to load.
     try std.testing.expectError(error.GlyphLoadFailed, renderer.drawTerminal(&font, &term));
+    // The terminal's flag is consumed, but the renderer keeps the damage.
+    const pin = term.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?;
+    try std.testing.expect(!pin.rowAndCell().row.dirty);
+    try std.testing.expect(renderer.damage.rows.items[1].stale);
     try std.testing.expect(renderer.damage.rows.items[1].pending[0]);
     try std.testing.expect(renderer.damage.rows.items[1].pending[1]);
-    const pin = term.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?;
-    try std.testing.expect(pin.rowAndCell().row.dirty);
+    // A failed frame never reaches the back buffer.
+    try std.testing.expectEqual(@as(u32, 0xDEADBEEF), pixels[0][3]);
     const alpha = try allocator.dupe(u8, &.{255});
     defer allocator.free(alpha);
     try font.glyphs.put(allocator, glyphKey('A', .regular, 1), .{ .pixels = alpha, .width = 1, .rows = 1, .left = 0, .top = 0 });
     try std.testing.expect(try renderer.drawTerminal(&font, &term));
-    try std.testing.expect(!pin.rowAndCell().row.dirty);
+    try std.testing.expect(!renderer.damage.rows.items[1].stale);
     try std.testing.expectEqual(rgbPixel(Colors.foreground), pixels[0][3]);
     renderer.completeFlip();
     _ = try renderer.drawTerminal(&font, &term);
@@ -1864,26 +1895,27 @@ test "SGR colors preserve indexed and RGB values and apply intensity and inverse
     for (expected, 0..) |colors, x| {
         const pin = term.screens.active.pages.pin(.{ .active = .{ .x = @intCast(x), .y = 0 } }).?;
         const cell = pin.rowAndCell().cell;
-        try std.testing.expectEqual(colors, cellColors(cell.*, pin.style(cell), &term));
+        try std.testing.expectEqual(colors, cellColors(cell.*, pin.style(cell), .of(&term)));
     }
     // Reverse-video must not swap explicit foreground/background pairs.
     stream.nextSlice("\x1b[?5h");
     for ([_]u16{ 4, 5 }) |x| {
         const pin = term.screens.active.pages.pin(.{ .active = .{ .x = x, .y = 0 } }).?;
         const cell = pin.rowAndCell().cell;
-        try std.testing.expectEqual(expected[x], cellColors(cell.*, pin.style(cell), &term));
+        try std.testing.expectEqual(expected[x], cellColors(cell.*, pin.style(cell), .of(&term)));
     }
     const pin = term.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?;
     const cell = pin.rowAndCell().cell;
-    try std.testing.expectEqual(CellColors{ .fg = 0xCD0000, .bg = fg }, cellColors(cell.*, pin.style(cell), &term));
+    try std.testing.expectEqual(CellColors{ .fg = 0xCD0000, .bg = fg }, cellColors(cell.*, pin.style(cell), .of(&term)));
     // Cached cells must continue to follow application palette updates.
     stream.nextSlice("\x1b]4;1;#123456\x07");
-    try std.testing.expectEqual(CellColors{ .fg = 0x123456, .bg = fg }, cellColors(cell.*, pin.style(cell), &term));
+    try std.testing.expectEqual(CellColors{ .fg = 0x123456, .bg = fg }, cellColors(cell.*, pin.style(cell), .of(&term)));
 }
 
 test "page flip completion releases the old buffer and pending flips prevent drawing" {
     var pixels = [_]u32{0};
-    var renderer = testRenderer(&pixels, 1, 1, 1);
+    var renderer = try testRenderer(&pixels, 1, 1, 1);
+    defer renderer.deinitDrawing();
     renderer.display_index = 0;
     renderer.render_index = 1;
     renderer.flip_pending = true;

@@ -72,13 +72,14 @@ const FramePacer = struct {
         return self.dirty and !flip_pending and now_ns >= self.next_frame_ns;
     }
 
-    fn timeoutMs(self: FramePacer, now_ns: i96, flip_pending: bool) c_int {
-        // Keep checking for shell exit even when descendants hold the PTY open.
-        if (!self.dirty or flip_pending) return 100;
+    /// Milliseconds until the next frame may be drawn, or null when nothing
+    /// is waiting on the clock.
+    fn timeoutMs(self: FramePacer, now_ns: i96, flip_pending: bool) ?c_int {
+        if (!self.dirty or flip_pending) return null;
         const remaining = self.next_frame_ns - now_ns;
         if (remaining <= 0) return 0;
         // Round up so sub-millisecond waits do not become busy polling.
-        return @intCast(@min(100, @divTrunc(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+        return @intCast(@min(std.math.maxInt(c_int), @divTrunc(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
     }
 
     fn presented(self: *FramePacer, now_ns: i96) void {
@@ -88,6 +89,13 @@ const FramePacer = struct {
         self.next_frame_ns = now_ns + self.interval_ns;
     }
 };
+
+/// The sooner of two poll timeouts, where null waits indefinitely.
+fn earliest(a: ?c_int, b: ?c_int) ?c_int {
+    const x = a orelse return b;
+    const y = b orelse return a;
+    return @min(x, y);
+}
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -226,6 +234,8 @@ pub fn main(init: std.process.Init) !void {
             .{ .fd = if (pty_closed) -1 else input.fd, .events = c.POLLIN, .revents = 0 },
             .{ .fd = if (renderer.flip_pending) renderer.fd else -1, .events = c.POLLIN, .revents = 0 },
             .{ .fd = seat.fd, .events = c.POLLIN, .revents = 0 },
+            // Wakes the loop to notice shell exit; pty.exited() then reaps it.
+            .{ .fd = if (pty_closed) -1 else pty.pidfd, .events = c.POLLIN, .revents = 0 },
         };
         // Drawing waits for both a free buffer and ownership of the display.
         const display_blocked = renderer.flip_pending or !renderer.active;
@@ -240,13 +250,11 @@ pub fn main(init: std.process.Init) !void {
             if (images.generation != generation) pacing.dirty = true;
         }
         var timeout = pacing.timeoutMs(poll_now, display_blocked);
-        if (animation_delay_ms) |delay| {
-            if (std.math.cast(c_int, delay)) |ms| timeout = @min(timeout, ms);
-        }
-        if (!pty_closed) {
-            if (input.repeat.timeoutMs(poll_now)) |repeat_ms| timeout = @min(timeout, repeat_ms);
-        }
-        if (c.poll(&fds, fds.len, timeout) < 0) {
+        if (animation_delay_ms) |delay| timeout = earliest(timeout, std.math.cast(c_int, delay));
+        if (!pty_closed) timeout = earliest(timeout, input.repeat.timeoutMs(poll_now));
+        // Retaking the display has no event to wait for, so retry periodically.
+        if (seat.active and !renderer.active) timeout = earliest(timeout, 100);
+        if (c.poll(&fds, fds.len, timeout orelse -1) < 0) {
             if (Pty.errno() == c.EINTR) continue;
             return error.PollFailed;
         }
@@ -295,16 +303,16 @@ test "frame pacing coalesces updates and preserves dirty while a flip is pending
     const interval = std.time.ns_per_s / 60;
     var pacing = FramePacer{ .interval_ns = interval, .next_frame_ns = 0 };
     pacing.presented(0);
-    try std.testing.expectEqual(@as(c_int, 100), pacing.timeoutMs(interval, false));
+    try std.testing.expectEqual(@as(?c_int, null), pacing.timeoutMs(interval, false));
     try std.testing.expect(!pacing.ready(interval, false));
 
     pacing.dirty = true;
     try std.testing.expect(!pacing.ready(interval - 1, false));
     try std.testing.expect(!pacing.ready(interval, true));
-    try std.testing.expectEqual(@as(c_int, 100), pacing.timeoutMs(interval, true));
+    try std.testing.expectEqual(@as(?c_int, null), pacing.timeoutMs(interval, true));
     try std.testing.expect(pacing.dirty);
     try std.testing.expect(pacing.ready(interval, false));
-    try std.testing.expectEqual(@as(c_int, 0), pacing.timeoutMs(interval, false));
+    try std.testing.expectEqual(@as(?c_int, 0), pacing.timeoutMs(interval, false));
 
     // A delayed submission starts a new interval instead of catching up.
     pacing.presented(10 * interval);
@@ -314,15 +322,22 @@ test "frame pacing coalesces updates and preserves dirty while a flip is pending
     try std.testing.expect(pacing.ready(11 * interval, false));
 }
 
-test "frame pacing rounds waits up and caps shell exit checks at 100ms" {
+test "frame pacing rounds waits up and only sets a deadline while dirty" {
     var pacing = FramePacer{ .interval_ns = std.time.ns_per_s, .next_frame_ns = std.time.ns_per_s, .dirty = true };
-    try std.testing.expectEqual(@as(c_int, 100), pacing.timeoutMs(0, false));
-    try std.testing.expectEqual(@as(c_int, 2), pacing.timeoutMs(std.time.ns_per_s - std.time.ns_per_ms - 1, false));
-    try std.testing.expectEqual(@as(c_int, 1), pacing.timeoutMs(std.time.ns_per_s - 1, false));
-    try std.testing.expectEqual(@as(c_int, 0), pacing.timeoutMs(std.time.ns_per_s, false));
-    try std.testing.expectEqual(@as(c_int, 0), pacing.timeoutMs(2 * std.time.ns_per_s, false));
+    try std.testing.expectEqual(@as(?c_int, 1000), pacing.timeoutMs(0, false));
+    try std.testing.expectEqual(@as(?c_int, 2), pacing.timeoutMs(std.time.ns_per_s - std.time.ns_per_ms - 1, false));
+    try std.testing.expectEqual(@as(?c_int, 1), pacing.timeoutMs(std.time.ns_per_s - 1, false));
+    try std.testing.expectEqual(@as(?c_int, 0), pacing.timeoutMs(std.time.ns_per_s, false));
+    try std.testing.expectEqual(@as(?c_int, 0), pacing.timeoutMs(2 * std.time.ns_per_s, false));
     pacing.dirty = false;
-    try std.testing.expectEqual(@as(c_int, 100), pacing.timeoutMs(2 * std.time.ns_per_s, false));
+    try std.testing.expectEqual(@as(?c_int, null), pacing.timeoutMs(2 * std.time.ns_per_s, false));
+}
+
+test "earliest poll timeout treats null as no deadline" {
+    try std.testing.expectEqual(@as(?c_int, null), earliest(null, null));
+    try std.testing.expectEqual(@as(?c_int, 5), earliest(null, 5));
+    try std.testing.expectEqual(@as(?c_int, 5), earliest(5, null));
+    try std.testing.expectEqual(@as(?c_int, 0), earliest(5, 0));
 }
 
 test "terminal stream parses split output and queues cursor reports" {

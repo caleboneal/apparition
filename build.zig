@@ -63,7 +63,6 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("ghostty-vt", ghostty.module("ghostty-vt"));
 
-    exe.root_module.linkSystemLibrary("gbm", .{});
     exe.root_module.linkSystemLibrary("freetype2", .{});
     exe.root_module.linkSystemLibrary("harfbuzz", .{ .use_pkg_config = .force });
     exe.root_module.linkSystemLibrary("input", .{});
