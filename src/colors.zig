@@ -1,24 +1,29 @@
 const std = @import("std");
 const ghosttyvt = @import("ghostty-vt");
+const Config = @import("config.zig");
 
 pub const foreground: ghosttyvt.color.RGB = .{ .r = 0xE5, .g = 0xE5, .b = 0xE5 };
-pub const background: ghosttyvt.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
+pub const background = hex((Config{}).background);
+
+fn hex(rgb: u24) ghosttyvt.color.RGB {
+    return .{
+        .r = @intCast(rgb >> 16),
+        .g = @truncate(rgb >> 8),
+        .b = @truncate(rgb),
+    };
+}
 
 // libghostty's first sixteen defaults are a theme, not xterm's ANSI palette.
 // Keep its standard 6x6x6 cube and grayscale ramp for indices 16..255.
 pub const palette: ghosttyvt.color.Palette = palette: {
     var result = ghosttyvt.color.default;
-    const ansi = [_]u32{
+    const ansi = [_]u24{
         0x000000, 0xCD0000, 0x00CD00, 0xCDCD00,
         0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
         0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00,
         0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
     };
-    for (ansi, 0..) |rgb, i| result[i] = .{
-        .r = @intCast((rgb >> 16) & 0xFF),
-        .g = @intCast((rgb >> 8) & 0xFF),
-        .b = @intCast(rgb & 0xFF),
-    };
+    for (ansi, 0..) |rgb, i| result[i] = hex(rgb);
     break :palette result;
 };
 

@@ -6,6 +6,10 @@ font_size: u8 = 16,
 // Mode 2027 keeps each grapheme cluster (emoji ZWJ sequences, flags, skin
 // tones, combining marks) in one cell. Programs can still toggle it.
 grapheme_clustering: bool = true,
+// Default background as 0xRRGGBB, also filling the display margins.
+// Programs can override it with OSC 11 and restore it with OSC 111.
+background: u24 = 0x0A0E14,
+
 // History lines kept above the screen, viewed with Shift+PageUp; 0 disables.
 scrollback_lines: usize = 10_000,
 // Bytes of decoded kitty graphics images kept before evicting old ones; 0

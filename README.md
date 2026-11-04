@@ -105,7 +105,9 @@ double, curly, dotted, and dashed styles, including spaces, wide cells, and
 SGR 58/59 underline colors. Colors use the xterm ANSI palette and standard
 256-color cube/grayscale ramp, with bold-as-bright ANSI foregrounds, faint
 text, inverse video, and truecolor support. Application OSC
-color changes and resets are honored.
+color changes and resets are honored. The default background, which also fills
+the display margins, is `background` in `src/config.zig` as `0xRRGGBB`
+(black by default); OSC 111 resets to it.
 
 ## Fonts
 

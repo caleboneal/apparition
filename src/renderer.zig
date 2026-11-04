@@ -1263,11 +1263,12 @@ test "cached glyphs render with backgrounds, reverse colors and transparent pixe
     _ = try renderer.drawTerminal(&font, &term);
     const red = rgbPixel(term.colors.palette.current[1]);
     const fg = rgbPixel(Colors.foreground);
-    try std.testing.expectEqualSlices(u32, &.{ fg, 0, red, red, 0, 0, 0, 0 }, &pixels);
+    const bg = rgbPixel(Colors.background);
+    try std.testing.expectEqualSlices(u32, &.{ fg, bg, red, red, bg, bg, bg, bg }, &pixels);
 
     stream.nextSlice("\x1b[?5h");
     _ = try renderer.drawTerminal(&font, &term);
-    try std.testing.expectEqualSlices(u32, &.{ 0, fg, red, red, fg, fg, fg, fg }, &pixels);
+    try std.testing.expectEqualSlices(u32, &.{ bg, fg, red, red, fg, fg, fg, fg }, &pixels);
 }
 
 test "SGR font styles and block cursor use the matching cached face" {
@@ -1294,15 +1295,16 @@ test "SGR font styles and block cursor use the matching cached face" {
     defer renderer.damage.deinit(allocator);
     _ = try renderer.drawTerminal(&font, &term);
     const fg = rgbPixel(Colors.foreground);
-    var expected = [_]u32{0} ** 20;
+    const bg = rgbPixel(Colors.background);
+    var expected = [_]u32{bg} ** 20;
     for ([_]usize{ 0, 5, 10, 15, 16 }) |x| expected[x] = fg;
     try std.testing.expectEqualSlices(u32, &expected, pixels[0..20]);
     try std.testing.expectEqualSlices(u32, &([_]u32{fg} ** 4), pixels[72..76]);
     stream.nextSlice("\x1b[1;4H\x1b[?25h");
     _ = try renderer.drawTerminal(&font, &term);
     // The block cursor inverts both the bold-italic glyph and its underline.
-    try std.testing.expectEqualSlices(u32, &.{ fg, fg, fg, 0 }, pixels[12..16]);
-    try std.testing.expectEqualSlices(u32, &([_]u32{0} ** 4), pixels[72..76]);
+    try std.testing.expectEqualSlices(u32, &.{ fg, fg, fg, bg }, pixels[12..16]);
+    try std.testing.expectEqualSlices(u32, &([_]u32{bg} ** 4), pixels[72..76]);
 }
 
 test "underline patterns stay within the cell and preserve framebuffer padding" {
@@ -1363,8 +1365,9 @@ test "underlines cover spaces and wide cells with colors, resets and invisibilit
     defer renderer.damage.deinit(allocator);
     _ = try renderer.drawTerminal(&font, &term);
     const fg = rgbPixel(Colors.foreground);
-    try std.testing.expectEqualSlices(u32, &.{ fg, fg, 0x123456, 0x123456, 0, 0, 0, 0, fg, fg, fg, fg, 0, 0 }, pixels[28..42]);
-    try std.testing.expectEqualSlices(u32, &([_]u32{0} ** 14), pixels[42..56]);
+    const bg = rgbPixel(Colors.background);
+    try std.testing.expectEqualSlices(u32, &.{ fg, fg, 0x123456, 0x123456, bg, bg, bg, bg, fg, fg, fg, fg, bg, bg }, pixels[28..42]);
+    try std.testing.expectEqualSlices(u32, &([_]u32{bg} ** 14), pixels[42..56]);
     // SGR 58 indexed colors follow palette changes, independent of glyph color.
     stream.nextSlice("\x1b[1;2H\x1b[4;58;5;1m \x1b]4;1;#abcdef\x07");
     _ = try renderer.drawTerminal(&font, &term);
@@ -1488,8 +1491,8 @@ test "box drawing fills whole cells so lines join across rows and columns" {
         try std.testing.expectEqual(fg, pixels[y * 15 + 2]);
         try std.testing.expectEqual(fg, pixels[y * 15 + 12]);
     }
-    try std.testing.expectEqual(@as(u32, 0), pixels[2 * 15 + 2]);
-    try std.testing.expectEqual(@as(u32, 0), pixels[10 * 15 + 7]);
+    try std.testing.expectEqual(rgbPixel(Colors.background), pixels[2 * 15 + 2]);
+    try std.testing.expectEqual(rgbPixel(Colors.background), pixels[10 * 15 + 7]);
 }
 
 test "box drawing ignores the font's glyphs and spans the font's cell" {
@@ -1773,7 +1776,8 @@ test "pending flips retain source damage and wide cursor moves erase the old row
     renderer.completeFlip();
     _ = try renderer.drawTerminal(&font, &term);
     const fg = rgbPixel(Colors.foreground);
-    try std.testing.expectEqualSlices(u32, &.{ fg, blendPixel(0, fg, 128), 0 }, pixels[0][0..3]);
+    const bg = rgbPixel(Colors.background);
+    try std.testing.expectEqualSlices(u32, &.{ fg, blendPixel(bg, fg, 128), bg }, pixels[0][0..3]);
     try std.testing.expectEqualSlices(u32, &pixels[0], &pixels[1]);
     // Repainting an unchanged cursor would blend its glyph a second time.
     try std.testing.expect(!try renderer.drawTerminal(&font, &term));
@@ -1826,14 +1830,15 @@ test "SGR colors preserve indexed and RGB values and apply intensity and inverse
     stream.nextSlice("\x1b[31mA\x1b[1mB\x1b[22;91mC\x1b[0;38;5;196mD" ++
         "\x1b[38;2;18;52;86;48;2;101;67;33mE\x1b[7mF\x1b[0;2;31mG\x1b[0;44m H");
     const fg = rgbPixel(Colors.foreground);
+    const bg = rgbPixel(Colors.background);
     const expected = [_]CellColors{
-        .{ .fg = 0xCD0000, .bg = 0 },
-        .{ .fg = 0xFF0000, .bg = 0 },
-        .{ .fg = 0xFF0000, .bg = 0 },
-        .{ .fg = 0xFF0000, .bg = 0 },
+        .{ .fg = 0xCD0000, .bg = bg },
+        .{ .fg = 0xFF0000, .bg = bg },
+        .{ .fg = 0xFF0000, .bg = bg },
+        .{ .fg = 0xFF0000, .bg = bg },
         .{ .fg = 0x123456, .bg = 0x654321 },
         .{ .fg = 0x654321, .bg = 0x123456 },
-        .{ .fg = 0x660000, .bg = 0 },
+        .{ .fg = blendPixel(bg, 0xCD0000, 128), .bg = bg },
         .{ .fg = fg, .bg = 0x0000EE },
         .{ .fg = fg, .bg = 0x0000EE },
     };
