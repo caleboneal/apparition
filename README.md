@@ -40,6 +40,17 @@ move a scrolled-back view. History keeps `scrollback_lines` (10,000) lines, set
 in `src/config.zig`; 0 disables it. The alternate screen used by full-screen
 programs has no history, so these keys reach the program there.
 
+The kitty graphics protocol is supported, so tools such as `kitten icat`,
+`chafa`, `timg`, and image previews in `yazi` or `ranger` can show images.
+PNG data is decoded with libpng; raw RGB and RGBA are accepted too. Images may
+be sent inline or, from local programs, by file, temporary file, or shared
+memory. Placements follow the protocol's z layers (over text, under text, or
+under cell backgrounds), scale and crop as requested, scroll with the text, and
+play animations. Decoded images share a `image_storage_limit` (320 MB) budget
+in `src/config.zig`; 0 disables the protocol. The PTY and CSI 14/16 t replies
+report the grid's pixel size so programs can size images to cells. Unicode
+placeholder placements (`U=1`, used by tmux passthrough) are not drawn yet.
+
 Ctrl+Alt+F1 through F12 switch virtual terminals (following the keymap's
 `XF86Switch_VT_*` keysyms). When launched from a VT, Apparition takes over that
 VT's switching (`VT_PROCESS`): switching away finishes any pending page flip,
@@ -109,7 +120,9 @@ redistributing the executable. The font files are from the official
 zig build test
 ```
 
-Tests cover PTY shell startup and sizing, exec failure, queued input,
+Tests cover PTY shell startup and sizing (including pixel size), exec
+failure, queued input, libpng decoding and kitty PNG transmissions, kitty image
+layering, scaling, and incremental redraws,
 terminal parsing/replies, keyboard translation and autorepeat timing, VT
 switch keys and request signaling, DRM routing helpers, and
 incremental rendering without requiring DRM or input hardware. Renderer tests

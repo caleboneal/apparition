@@ -5,6 +5,7 @@ const Config = @import("config.zig");
 const Colors = @import("colors.zig");
 const Pty = @import("pty.zig");
 const Vt = @import("vt.zig");
+const Png = @import("png.zig");
 const c = Pty.c;
 const ghosttyvt = @import("ghostty-vt");
 
@@ -45,10 +46,23 @@ const Session = struct {
         return .{};
     }
 
+    // Answers CSI 14/16/18 t, which image tools use to learn the cell size.
+    fn size(handler: *ghosttyvt.TerminalStream.Handler) ?ghosttyvt.size_report.Size {
+        const term = handler.terminal;
+        if (term.cols == 0 or term.rows == 0) return null;
+        return .{
+            .rows = term.rows,
+            .columns = term.cols,
+            .cell_width = term.width_px / term.cols,
+            .cell_height = term.height_px / term.rows,
+        };
+    }
+
     fn init(pty: *Pty, stream: ghosttyvt.TerminalStream) Session {
         var session = Session{ .pty = pty, .stream = stream };
         session.stream.handler.effects.write_pty = &writePty;
         session.stream.handler.effects.device_attributes = &deviceAttributes;
+        session.stream.handler.effects.size = &size;
         return session;
     }
 };
@@ -106,22 +120,34 @@ pub fn main(init: std.process.Init) !void {
     const cols: u16 = @intCast(renderer.mode.hdisplay / font.cell_width);
     const rows: u16 = @intCast(renderer.mode.vdisplay / font.cell_height);
     if (cols == 0 or rows == 0) return error.DisplayTooSmall;
+    ghosttyvt.sys.decode_png = &Png.decode;
     var term = try ghosttyvt.Terminal.init(io, gpa, .{
         .cols = cols,
         .rows = rows,
         // Limit history by lines; a zero byte limit is what disables it.
         .max_scrollback_bytes = if (config.scrollback_lines == 0) 0 else null,
         .max_scrollback_lines = config.scrollback_lines,
+        .kitty_image_storage_limit = config.image_storage_limit,
     });
     defer term.deinit(gpa);
     try Colors.configure(&term, gpa);
-    term.width_px = renderer.mode.hdisplay;
-    term.height_px = renderer.mode.vdisplay;
+    // Kitty placements derive the cell size from these, so cover exactly the
+    // grid; the display's leftover margin is not part of any cell.
+    term.width_px = @as(u32, cols) * font.cell_width;
+    term.height_px = @as(u32, rows) * font.cell_height;
+    // Let local programs send images by path, as kitty and Ghostty do.
+    const tmpdir = c.getenv("TMPDIR");
+    term.setKittyGraphicsLoadingLimits(.allWithTempDir(if (tmpdir != null and tmpdir[0] != 0) std.mem.span(tmpdir) else "/tmp"));
 
     if (c.setenv("TERM", "xterm-256color", 1) != 0) return error.SetEnvironmentFailed;
     const shell = c.getenv("SHELL");
     const shell_path: [*:0]const u8 = if (shell != null and shell[0] != 0) @ptrCast(shell) else "/bin/sh";
-    var pty = try Pty.init(gpa, shell_path, rows, cols);
+    var pty = try Pty.init(gpa, shell_path, .{
+        .rows = rows,
+        .cols = cols,
+        .width_px = std.math.cast(u16, term.width_px) orelse std.math.maxInt(u16),
+        .height_px = std.math.cast(u16, term.height_px) orelse std.math.maxInt(u16),
+    });
     defer pty.deinit();
     var session = Session.init(&pty, .init(.{ .allocator = gpa, .handler = .init(&term) }));
     defer session.stream.deinit();
@@ -226,7 +252,19 @@ pub fn main(init: std.process.Init) !void {
         // Drawing waits for both a free buffer and ownership of the display.
         const display_blocked = renderer.flip_pending or !renderer.active;
         const poll_now = std.Io.Clock.awake.now(io).toNanoseconds();
+        // Advance animated kitty images while visible; a new frame bumps the
+        // storage generation.
+        var animation_delay_ms: ?u64 = null;
+        if (renderer.active) {
+            const images = &term.screens.active.kitty_images;
+            const generation = images.generation;
+            animation_delay_ms = images.animationTick(io, @intCast(@divTrunc(poll_now, std.time.ns_per_ms)));
+            if (images.generation != generation) pacing.dirty = true;
+        }
         var timeout = pacing.timeoutMs(poll_now, display_blocked);
+        if (animation_delay_ms) |delay| {
+            if (std.math.cast(c_int, delay)) |ms| timeout = @min(timeout, ms);
+        }
         if (!pty_closed) {
             if (input.repeat.timeoutMs(poll_now)) |repeat_ms| timeout = @min(timeout, repeat_ms);
         }
@@ -332,4 +370,5 @@ test {
     _ = @import("input/keyboard.zig");
     _ = @import("renderer.zig");
     _ = @import("vt.zig");
+    _ = @import("png.zig");
 }

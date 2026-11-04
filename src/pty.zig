@@ -11,6 +11,7 @@ pub const c = @cImport({
     @cInclude("pty.h");
     @cInclude("signal.h");
     @cInclude("stdlib.h");
+    @cInclude("sys/ioctl.h");
     @cInclude("sys/wait.h");
     @cInclude("unistd.h");
 });
@@ -24,7 +25,16 @@ pending: std.ArrayList(u8) = .empty,
 written: usize = 0,
 allocator: std.mem.Allocator,
 
-pub fn init(allocator: std.mem.Allocator, shell: [*:0]const u8, rows: u16, cols: u16) !Self {
+/// Window size reported through TIOCGWINSZ. Image tools size their output
+/// from the pixel dimensions, so report the cell grid's area, not the display's.
+pub const Size = struct {
+    rows: u16,
+    cols: u16,
+    width_px: u16 = 0,
+    height_px: u16 = 0,
+};
+
+pub fn init(allocator: std.mem.Allocator, shell: [*:0]const u8, window: Size) !Self {
     var exec_pipe: [2]c_int = undefined;
     if (c.pipe2(&exec_pipe, c.O_CLOEXEC) != 0) return error.PipeFailed;
     defer _ = c.close(exec_pipe[0]);
@@ -34,8 +44,10 @@ pub fn init(allocator: std.mem.Allocator, shell: [*:0]const u8, rows: u16, cols:
     };
 
     var size = std.mem.zeroes(c.struct_winsize);
-    size.ws_row = rows;
-    size.ws_col = cols;
+    size.ws_row = window.rows;
+    size.ws_col = window.cols;
+    size.ws_xpixel = window.width_px;
+    size.ws_ypixel = window.height_px;
     var master: c_int = undefined;
     const pid = c.forkpty(&master, null, null, &size);
     if (pid < 0) return error.ForkPtyFailed;
@@ -152,8 +164,12 @@ pub fn errno() c_int {
 }
 
 test "PTY starts an interactive shell with a controlling terminal and window size" {
-    var pty = try Self.init(std.testing.allocator, "/bin/sh", 31, 97);
+    var pty = try Self.init(std.testing.allocator, "/bin/sh", .{ .rows = 31, .cols = 97, .width_px = 873, .height_px = 620 });
     defer pty.deinit();
+    var window: c.struct_winsize = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.ioctl(pty.fd, c.TIOCGWINSZ, &window));
+    try std.testing.expectEqual(@as(c_ushort, 873), window.ws_xpixel);
+    try std.testing.expectEqual(@as(c_ushort, 620), window.ws_ypixel);
     try pty.queue("test -t 0 && test -t 1 && test -t 2 && stty size; printf 'pty-%s\\n' ready; exit\r");
     try pty.flush();
 
@@ -178,7 +194,7 @@ test "PTY starts an interactive shell with a controlling terminal and window siz
 }
 
 test "PTY reports a shell exec failure" {
-    try std.testing.expectError(error.ShellExecFailed, Self.init(std.testing.allocator, "/nonexistent-apparition-shell", 24, 80));
+    try std.testing.expectError(error.ShellExecFailed, Self.init(std.testing.allocator, "/nonexistent-apparition-shell", .{ .rows = 24, .cols = 80 }));
 }
 
 test "PTY preserves queued bytes across a partial write" {

@@ -29,6 +29,13 @@ pub fn build(b: *std.Build) void {
     });
     addPkgConfigIncludes(b, freetype, "freetype2");
 
+    const libpng = b.addTranslateC(.{
+        .root_source_file = b.path("src/c/libpng.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addPkgConfigIncludes(b, libpng, "libpng");
+
     const exe = b.addExecutable(.{
         .name = "apparition",
         .root_module = b.createModule(.{
@@ -48,10 +55,12 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("xkbcommon", .{});
     exe.root_module.linkSystemLibrary("drm", .{});
     exe.root_module.linkSystemLibrary("util", .{});
+    exe.root_module.linkSystemLibrary("libpng", .{ .use_pkg_config = .force });
 
     exe.root_module.addImport("libinput", libinput.createModule());
     exe.root_module.addImport("libdrm", libdrm.createModule());
     exe.root_module.addImport("freetype", freetype.createModule());
+    exe.root_module.addImport("libpng", libpng.createModule());
 
     b.installArtifact(exe);
     b.installFile("src/fonts/OFL.txt", "share/licenses/apparition/JetBrainsMono-OFL.txt");

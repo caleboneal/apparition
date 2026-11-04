@@ -26,6 +26,7 @@
               pkgs.libdrm
               pkgs.libgbm
               pkgs.freetype
+              pkgs.libpng
               pkgs.libinput
               pkgs.systemd
               pkgs.libxkbcommon

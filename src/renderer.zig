@@ -6,6 +6,7 @@ const freetype = @import("freetype");
 const ghosttyvt = @import("ghostty-vt");
 const Drm = @import("drm.zig");
 const Colors = @import("colors.zig");
+const Images = @import("renderer/images.zig");
 
 const Self = @This();
 
@@ -220,6 +221,10 @@ saved_crtc: ?*libdrm.drmModeCrtc,
 is_modeset: bool = false,
 /// False while another VT owns the display; do not present until activate.
 active: bool = true,
+/// Kitty placements drawn by the latest frame, and by the frame before it
+/// (only its geometry is meaningful), to find rows whose images changed.
+images: std.ArrayList(Images.Visible) = .empty,
+previous_images: std.ArrayList(Images.Visible) = .empty,
 
 pub fn init(allocator: std.mem.Allocator) !Self {
     var device = try Drm.Device.init();
@@ -471,6 +476,19 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
         row.page_y = pin.y;
     }
 
+    // Repaint rows an image covered last frame or covers now whenever any
+    // placement appeared, moved, changed pixels, or disappeared.
+    std.mem.swap(std.ArrayList(Images.Visible), &self.images, &self.previous_images);
+    Images.collect(self.allocator, &self.images, term, font.cell_width, font.cell_height) catch |err| {
+        self.damage.invalidate();
+        return err;
+    };
+    if (!Images.sameGeometry(self.previous_images.items, self.images.items)) {
+        for (self.previous_images.items) |image| self.markImageRows(image.geometry, font.cell_height);
+        for (self.images.items) |image| self.markImageRows(image.geometry, font.cell_height);
+    }
+    const grid_width: u32 = @intCast(@min(@as(u64, screen.pages.cols) * font.cell_width, self.mode.hdisplay));
+
     const full = self.damage.full[self.render_index];
     var changed = full;
     if (full) self.clear(default_bg);
@@ -487,6 +505,8 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
         changed = true;
         if (cursor.visible and row_index == cursor.y) redraw_cursor = true;
         if (!full) self.fill_rect(default_bg, .{ .x = 0, .y = y, .width = self.mode.hdisplay, .height = font.cell_height });
+        const strip: Rect = .{ .x = 0, .y = y, .width = grid_width, .height = font.cell_height };
+        self.drawImages(.below_background, strip);
         const cells = pin.cells(.all);
         // Paint backgrounds first so the trailing spacer never erases a wide glyph.
         for (cells, 0..) |*cell, column| {
@@ -496,6 +516,7 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
             if (colors.bg != default_bg)
                 self.fill_rect(colors.bg, .{ .x = @intCast(x), .y = y, .width = font.cell_width, .height = font.cell_height });
         }
+        self.drawImages(.below_text, strip);
         for (cells, 0..) |*cell, column| {
             const x = @as(u64, column) * font.cell_width;
             if (x >= self.mode.hdisplay) break;
@@ -513,6 +534,7 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
             const underline_color = if (style.underlineColor(&term.colors.palette.current)) |rgb| rgbPixel(rgb) else colors.fg;
             self.drawUnderline(font, style, rect, underline_color);
         }
+        self.drawImages(.above_text, strip);
     }
 
     if (redraw_cursor) try self.drawCursor(font, term, cursor.y);
@@ -532,6 +554,43 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
         pin.node.page().dirty = false;
     }
     return changed;
+}
+
+fn markImageRows(self: *Self, geometry: Images.Geometry, cell_height: u32) void {
+    if (cell_height == 0) return;
+    const first = @max(0, @divFloor(geometry.y, cell_height));
+    const end = @divFloor(geometry.y + geometry.height + cell_height - 1, cell_height);
+    var row = first;
+    while (row < end and row < self.damage.rows.items.len) : (row += 1) self.damage.mark(@intCast(row));
+}
+
+fn drawImages(self: *Self, layer: Images.Layer, clip: Rect) void {
+    for (self.images.items) |image| {
+        if (Images.layer(image.geometry.z) == layer) self.drawImage(image, clip);
+    }
+}
+
+/// Draw the part of a placement inside clip, blending straight alpha.
+fn drawImage(self: *Self, image: Images.Visible, clip: Rect) void {
+    const g = image.geometry;
+    const framebuffer = self.framebuffers[self.render_index];
+    const pixels: [*]u32 = @ptrCast(@alignCast(framebuffer.map));
+    const x0 = @max(g.x, clip.x);
+    const x1 = @min(g.x + g.width, @as(i64, clip.x) + clip.width, self.mode.hdisplay);
+    const y0 = @max(g.y, clip.y);
+    const y1 = @min(g.y + g.height, @as(i64, clip.y) + clip.height, self.mode.vdisplay);
+    var y = y0;
+    while (y < y1) : (y += 1) {
+        const row = pixels[@as(usize, @intCast(y)) * framebuffer.stride ..];
+        var x = x0;
+        while (x < x1) : (x += 1) {
+            const rgba = image.sample(x, y);
+            if (rgba[3] == 0) continue;
+            const color = (@as(u32, rgba[0]) << 16) | (@as(u32, rgba[1]) << 8) | rgba[2];
+            const pixel = &row[@intCast(x)];
+            pixel.* = if (rgba[3] == 255) color else blendPixel(pixel.*, color, rgba[3]);
+        }
+    }
 }
 
 fn drawCursor(self: *Self, font: *Font, term: *ghosttyvt.Terminal, row: u16) !void {
@@ -740,6 +799,8 @@ fn page_flip_handler(
 
 pub fn deinit(self: *Self) void {
     self.damage.deinit(self.allocator);
+    self.images.deinit(self.allocator);
+    self.previous_images.deinit(self.allocator);
     // Normal shell exit already drains flips. Signals and error exits may not.
     if (self.flip_pending) self.finishPendingFlip();
     // While switched away, the display belongs to the active VT.
@@ -1222,6 +1283,72 @@ test "scrolled viewports render history and hide an off-screen cursor" {
     try std.testing.expectEqual(@as(?u16, null), cursorRow(screen));
     term.scrollViewport(.{ .delta = 1 });
     try std.testing.expectEqual(@as(?u16, 2), cursorRow(screen));
+}
+
+test "kitty images draw in z layers and incremental frames match full redraws" {
+    const allocator = std.testing.allocator;
+    var font = testFont();
+    var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 4, .rows = 3 });
+    defer term.deinit(allocator);
+    try Colors.configure(&term, allocator);
+    term.width_px = 4;
+    term.height_px = 3;
+    var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
+    defer stream.deinit();
+    var pixels = [_][12]u32{[_]u32{99} ** 12} ** 2;
+    var expected = [_]u32{99} ** 12;
+    var renderer = testRenderer(&pixels[0], 4, 3, 4);
+    renderer.framebuffers[1].map = &pixels[1];
+    defer renderer.damage.deinit(allocator);
+    defer renderer.images.deinit(allocator);
+    defer renderer.previous_images.deinit(allocator);
+    var reference = testRenderer(&expected, 4, 3, 4);
+    defer reference.damage.deinit(allocator);
+    defer reference.images.deinit(allocator);
+    defer reference.previous_images.deinit(allocator);
+
+    // A 2x2 RGB image, one pixel per cell: red, green / blue, white.
+    const rgb = [_]u8{ 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255 };
+    var base64: [16]u8 = undefined;
+    var transmit_buffer: [64]u8 = undefined;
+    // C=1 keeps the cursor still, so placing on the last row does not scroll.
+    const transmit = try std.fmt.bufPrint(&transmit_buffer, "\x1b_Ga=T,f=24,s=2,v=2,i=1,p=1,C=1,q=2;{s}\x1b\\", .{std.base64.standard.Encoder.encode(&base64, &rgb)});
+
+    const red = 0xFF0000;
+    const default_bg = rgbPixel(Colors.background);
+    const Check = struct { index: usize, value: u32 };
+    const Step = struct { update: []const u8, checks: []const Check = &.{} };
+    const steps = [_]Step{
+        .{ .update = "\x1b[?25l" },
+        .{ .update = transmit, .checks = &.{ .{ .index = 0, .value = red }, .{ .index = 5, .value = 0xFFFFFF } } },
+        // z = 0 draws over text and its background.
+        .{ .update = "\x1b[1;1H\x1b[44m \x1b[0m", .checks = &.{.{ .index = 0, .value = red }} },
+        // Negative z draws over cell backgrounds but under text.
+        .{
+            .update = "\x1b[1;4H\x1b_Ga=p,i=1,p=2,z=-1,c=1,r=1,C=1,q=2\x1b\\\x1b[42m \x1b[0m",
+            .checks = &.{.{ .index = 3, .value = red }},
+        },
+        // Below INT32_MIN/2, only default-background cells show the image.
+        .{
+            .update = "\x1b[3;3H\x1b_Ga=p,i=1,p=3,z=-2147483648,c=1,r=1,C=1,q=2\x1b\\" ++
+                "\x1b[3;4H\x1b_Ga=p,i=1,p=4,z=-2147483648,c=1,r=1,C=1,q=2\x1b\\\x1b[42m \x1b[0m",
+            .checks = &.{ .{ .index = 10, .value = red }, .{ .index = 11, .value = 0x00CD00 } },
+        },
+        .{ .update = "\x1b_Ga=d,d=i,i=1,p=1,q=2\x1b\\", .checks = &.{.{ .index = 5, .value = default_bg }} },
+        // Placements scroll with the text they were placed on.
+        .{ .update = "\x1b[3;1H\r\n", .checks = &.{.{ .index = 6, .value = red }} },
+        .{ .update = "\x1bc" },
+    };
+    for (steps) |step| {
+        stream.nextSlice(step.update);
+        const changed = try renderer.drawTerminal(&font, &term);
+        reference.damage.invalidate();
+        _ = try reference.drawTerminal(&font, &term);
+        try std.testing.expectEqualSlices(u32, &expected, &pixels[renderer.render_index]);
+        for (step.checks) |check| try std.testing.expectEqual(check.value, expected[check.index]);
+        if (changed) renderer.completeFlip();
+    }
+    try std.testing.expectEqual(@as(usize, 0), renderer.images.items.len);
 }
 
 test "pending flips retain source damage and wide cursor moves erase the old row" {
