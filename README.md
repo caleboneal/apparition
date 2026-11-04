@@ -14,16 +14,17 @@ zig build
 zig build run
 ```
 
-Run on Linux with access to a primary DRM node in `/dev/dri` and the input
-devices on `seat0`, with DRM master available (normally from an active virtual
-console without another display server owning the device). Apparition discovers
+Run on Linux from a local login on a virtual console. Apparition takes control
+of the session's seat through libseat (`logind`, `seatd`, or as root its
+builtin backend), which opens the DRM and input devices for it, so no `input`
+group membership, device permissions, or `sudo` are needed. It waits up to ten
+seconds for the session to be the active VT, and fails if another display
+server already holds DRM master. Apparition discovers
 DRM cards and selects one with dumb-buffer support and a connected, routable
 output, skipping inaccessible or unsuitable cards. It prefers an existing
 compatible display route and the output's preferred mode, and logs the selected
 card, connector, and CRTC. JetBrains Mono is bundled, so no system font
-installation is needed. See [Fonts](#fonts) for configuration. Running via
-`sudo` also runs the shell as root, so prefer appropriate device permissions
-when possible.
+installation is needed. See [Fonts](#fonts) for configuration.
 
 Keyboards are discovered through libinput/udev. Input supports UTF-8, Shift,
 Ctrl combinations such as Ctrl-C/Ctrl-D, Alt, Enter, Backspace, Tab, Escape,
@@ -52,11 +53,13 @@ report the grid's pixel size so programs can size images to cells. Unicode
 placeholder placements (`U=1`, used by tmux passthrough) are not drawn yet.
 
 Ctrl+Alt+F1 through F12 switch virtual terminals (following the keymap's
-`XF86Switch_VT_*` keysyms). When launched from a VT, Apparition takes over that
-VT's switching (`VT_PROCESS`): switching away finishes any pending page flip,
-drops DRM master, and closes input devices; switching back retakes them and
-does a full modeset and redraw. If the shell exits while another VT is active,
-Apparition quits without touching the display.
+`XF86Switch_VT_*` keysyms) through the seat provider, which also disables the
+console keyboard and restores the VT if Apparition exits or crashes. Switching
+away finishes any pending page flip and closes input devices before
+acknowledging; the seat provider revokes DRM master and any input still open,
+so other sessions' keys never reach this shell. Switching back reopens input
+and does a full modeset and redraw. If the shell exits while another VT is
+active, Apparition quits without touching the display.
 
 Use `exit` or Ctrl-D at an empty shell prompt to close the terminal. Normal
 shutdown restores the previous display and console keyboard modes and reaps
@@ -124,7 +127,7 @@ Tests cover PTY shell startup and sizing (including pixel size), exec
 failure, queued input, libpng decoding and kitty PNG transmissions, kitty image
 layering, scaling, and incremental redraws,
 terminal parsing/replies, keyboard translation and autorepeat timing, VT
-switch keys and request signaling, DRM routing helpers, and
+switch keys and seat enable/disable ordering, DRM routing helpers, and
 incremental rendering without requiring DRM or input hardware. Renderer tests
 compare dirty-row frames against full redraws through buffer flips, cursor
 changes, scrolling, scrollback viewports, screen switches, color changes, and

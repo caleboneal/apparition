@@ -28,6 +28,7 @@
               pkgs.freetype
               pkgs.libpng
               pkgs.libinput
+              pkgs.seatd
               pkgs.systemd
               pkgs.libxkbcommon
               pkgs.libGL # Provides EGL and OpenGL headers

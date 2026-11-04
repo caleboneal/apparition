@@ -6,6 +6,7 @@ const udev = @cImport({
 });
 
 pub const Keyboard = @import("input/keyboard.zig");
+const Seat = @import("seat.zig");
 
 const Self = @This();
 
@@ -61,20 +62,26 @@ repeat: Repeat,
 /// Borrowed libinput descriptor; poll for readability, but do not read or close it.
 fd: c_int,
 
+/// libinput returns -errno on failure.
 fn openRestricted(path: [*c]const u8, flags: c_int, user_data: ?*anyopaque) callconv(.c) c_int {
-    _ = user_data;
-    var open_flags: linux.O = @bitCast(flags);
-    open_flags.CLOEXEC = true;
-    const result = linux.open(@ptrCast(path), open_flags, 0);
-    const err = linux.errno(result);
-    // Linux syscalls return an unsigned representation of -errno on failure.
-    if (err != .SUCCESS) return -@as(c_int, @intCast(@intFromEnum(err)));
-    return @intCast(result);
+    const seat: *Seat = @ptrCast(@alignCast(user_data.?));
+    const fd = seat.openDevice(path) catch |err| return switch (err) {
+        error.OutOfMemory => -@as(c_int, @intFromEnum(linux.E.NOMEM)),
+        error.DeviceUnavailable => if (std.c._errno().* > 0) -std.c._errno().* else -@as(c_int, @intFromEnum(linux.E.IO)),
+    };
+    // Seat providers do not apply open flags, and libinput reads nonblocking.
+    const requested: linux.O = @bitCast(flags);
+    if (requested.NONBLOCK) {
+        const status = linux.fcntl(fd, linux.F.GETFL, 0);
+        if (linux.errno(status) == .SUCCESS)
+            _ = linux.fcntl(fd, linux.F.SETFL, status | @as(u32, @bitCast(linux.O{ .NONBLOCK = true })));
+    }
+    return fd;
 }
 
 fn closeRestricted(fd: c_int, user_data: ?*anyopaque) callconv(.c) void {
-    _ = user_data;
-    _ = linux.close(fd);
+    const seat: *Seat = @ptrCast(@alignCast(user_data.?));
+    seat.closeDevice(fd);
 }
 
 const interface = libinput.libinput_interface{
@@ -82,15 +89,16 @@ const interface = libinput.libinput_interface{
     .close_restricted = closeRestricted,
 };
 
-pub fn init(repeat: Repeat) !Self {
+/// The seat must outlive the returned input.
+pub fn init(seat: *Seat, repeat: Repeat) !Self {
     const ud = udev.udev_new() orelse return error.UdevInitFailed;
     defer _ = udev.udev_unref(ud);
 
-    const context = libinput.libinput_udev_create_context(&interface, null, @ptrCast(ud)) orelse
+    const context = libinput.libinput_udev_create_context(&interface, seat, @ptrCast(ud)) orelse
         return error.LibinputInitFailed;
     errdefer _ = libinput.libinput_unref(context);
 
-    if (libinput.libinput_udev_assign_seat(context, "seat0") != 0)
+    if (libinput.libinput_udev_assign_seat(context, seat.name()) != 0)
         return error.SeatAssignmentFailed;
 
     return .{
@@ -204,16 +212,6 @@ test "zero repeat rate disables autorepeat" {
     repeat.press(30, 0);
     try std.testing.expectEqual(@as(?c_int, null), repeat.timeoutMs(0));
     try std.testing.expectEqual(@as(?u32, null), repeat.due(std.time.ns_per_s));
-}
-
-test "restricted open reports negative errno and sets CLOEXEC" {
-    try std.testing.expectEqual(-@as(c_int, @intFromEnum(linux.E.NOENT)), openRestricted("/dev/apparition-nonexistent-input-device", 0, null));
-    const device = openRestricted("/dev/null", 0, null);
-    try std.testing.expect(device >= 0);
-    defer closeRestricted(device, null);
-    const flags = linux.fcntl(device, linux.F.GETFD, 0);
-    try std.testing.expect(linux.errno(flags) == .SUCCESS);
-    try std.testing.expect(flags & 1 != 0); // FD_CLOEXEC
 }
 
 test "input API compiles" {

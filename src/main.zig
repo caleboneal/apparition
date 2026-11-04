@@ -4,15 +4,11 @@ const Input = @import("input.zig");
 const Config = @import("config.zig");
 const Colors = @import("colors.zig");
 const Pty = @import("pty.zig");
-const Vt = @import("vt.zig");
+const Seat = @import("seat.zig");
 const Png = @import("png.zig");
 const c = Pty.c;
 const ghosttyvt = @import("ghostty-vt");
 
-const console = @cImport({
-    @cInclude("linux/kd.h");
-    @cInclude("sys/ioctl.h");
-});
 const config = Config{};
 var stopping = std.atomic.Value(bool).init(false);
 
@@ -106,7 +102,13 @@ pub fn main(init: std.process.Init) !void {
         .flags = 0,
     }, null);
 
-    var renderer = try Renderer.init(gpa);
+    // The seat provider owns the VT: it disables the console keyboard, grants
+    // and revokes device access, and switches VTs on our behalf.
+    var seat: Seat = undefined;
+    try seat.init(gpa);
+    defer seat.deinit();
+
+    var renderer = try Renderer.init(gpa, &seat);
     defer renderer.deinit();
     var font = try Renderer.Font.init(gpa, .{
         .directory = config.font_directory,
@@ -114,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
         .pixel_size = config.font_size,
     });
     defer font.deinit();
-    var input = try Input.init(.init(config.repeat_delay_ms, config.repeat_rate));
+    var input = try Input.init(&seat, .init(config.repeat_delay_ms, config.repeat_rate));
     defer input.deinit();
 
     const cols: u16 = @intCast(renderer.mode.hdisplay / font.cell_width);
@@ -152,31 +154,6 @@ pub fn main(init: std.process.Init) !void {
     var session = Session.init(&pty, .init(.{ .allocator = gpa, .handler = .init(&term) }));
     defer session.stream.deinit();
 
-    // When launched from a Linux VT, libinput owns keyboard input while we
-    // draw. Do not also deliver those keys to the launching console.
-    var keyboard_mode: c_int = 0;
-    const on_console = console.ioctl(0, console.KDGKBMODE, &keyboard_mode) == 0;
-    if (on_console and console.ioctl(0, console.KDSKBMODE, @as(c_int, console.K_OFF)) != 0)
-        return error.DisableConsoleKeyboardFailed;
-    defer if (on_console) {
-        _ = console.ioctl(0, console.KDSKBMODE, keyboard_mode);
-    };
-
-    var display_mode: c_int = 0;
-    const has_display_mode = on_console and console.ioctl(0, console.KDGETMODE, &display_mode) == 0;
-    if (has_display_mode and console.ioctl(0, console.KDSETMODE, @as(c_int, console.KD_GRAPHICS)) != 0)
-        return error.SetConsoleGraphicsFailed;
-    defer if (has_display_mode) {
-        _ = console.ioctl(0, console.KDSETMODE, display_mode);
-    };
-
-    // With the console keyboard off, the kernel no longer handles Ctrl+Alt+Fn,
-    // so switch VTs ourselves and hand over the display and input on request.
-    var vt: ?Vt = if (has_display_mode) Vt.init(0) catch |err| blk: {
-        std.log.warn("VT switching unavailable: {s}", .{@errorName(err)});
-        break :blk null;
-    } else null;
-    defer if (vt) |*v| v.deinit();
     var display_retry = false;
 
     _ = try renderer.drawTerminal(&font, &term);
@@ -191,27 +168,27 @@ pub fn main(init: std.process.Init) !void {
     var output: [4096]u8 = undefined;
     var keys: [64]u8 = undefined;
     while (!stopping.load(.monotonic)) {
-        if (vt) |*v| {
-            while (v.next()) |event| switch (event) {
-                .release => if (v.active) {
+        while (seat.next()) |event| switch (event) {
+            .disable => {
+                if (seat.active) {
                     renderer.deactivate();
                     try input.deactivate();
-                    v.release();
-                },
-                .acquire => if (!v.active) {
-                    v.acquire();
-                    try input.activate();
-                    display_retry = false;
-                },
-            };
-            // The previous VT's owner may still hold DRM master briefly.
-            if (v.active and !renderer.active) {
-                if (renderer.activate()) {
-                    pacing.dirty = true;
-                } else |err| if (!display_retry) {
-                    std.log.warn("Cannot retake display, retrying: {s}", .{@errorName(err)});
-                    display_retry = true;
                 }
+                seat.disable();
+            },
+            .enable => {
+                seat.enable();
+                try input.activate();
+                display_retry = false;
+            },
+        };
+        // The previous session's owner may still hold DRM master briefly.
+        if (seat.active and !renderer.active) {
+            if (renderer.activate()) {
+                pacing.dirty = true;
+            } else |err| if (!display_retry) {
+                std.log.warn("Cannot retake display, retrying: {s}", .{@errorName(err)});
+                display_retry = true;
             }
         }
 
@@ -228,7 +205,7 @@ pub fn main(init: std.process.Init) !void {
                     }
                     try pty.queue(bytes);
                 },
-                .switch_vt => |number| if (vt) |*v| v.activate(number),
+                .switch_vt => |number| seat.switchSession(number),
                 .scroll => |scroll| {
                     term.scrollViewport(switch (scroll) {
                         .page_up => .{ .delta = -@as(isize, rows) },
@@ -247,7 +224,7 @@ pub fn main(init: std.process.Init) !void {
             .{ .fd = if (pty_closed) -1 else pty.fd, .events = @intCast(c.POLLIN | (if (pty.wantsWrite()) c.POLLOUT else @as(c_int, 0))), .revents = 0 },
             .{ .fd = if (pty_closed) -1 else input.fd, .events = c.POLLIN, .revents = 0 },
             .{ .fd = if (renderer.flip_pending) renderer.fd else -1, .events = c.POLLIN, .revents = 0 },
-            .{ .fd = if (vt) |v| v.fd else -1, .events = c.POLLIN, .revents = 0 },
+            .{ .fd = seat.fd, .events = c.POLLIN, .revents = 0 },
         };
         // Drawing waits for both a free buffer and ownership of the display.
         const display_blocked = renderer.flip_pending or !renderer.active;
@@ -279,6 +256,7 @@ pub fn main(init: std.process.Init) !void {
 
         if (fds[2].revents & (c.POLLERR | c.POLLHUP) != 0) return error.DisplayDisconnected;
         if (fds[2].revents & c.POLLIN != 0) try renderer.handleEvents();
+        if (fds[3].revents & (c.POLLIN | c.POLLERR | c.POLLHUP) != 0) try seat.dispatch();
 
         if (!pty_closed) {
             var drained = false;
@@ -369,6 +347,6 @@ test {
     _ = @import("pty.zig");
     _ = @import("input/keyboard.zig");
     _ = @import("renderer.zig");
-    _ = @import("vt.zig");
+    _ = @import("seat.zig");
     _ = @import("png.zig");
 }

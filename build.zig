@@ -22,6 +22,13 @@ pub fn build(b: *std.Build) void {
     addPkgConfigIncludes(b, libinput, "libinput");
     addPkgConfigIncludes(b, libinput, "libudev");
 
+    const libseat = b.addTranslateC(.{
+        .root_source_file = b.path("src/c/libseat.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addPkgConfigIncludes(b, libseat, "libseat");
+
     const freetype = b.addTranslateC(.{
         .root_source_file = b.path("src/c/freetype.h"),
         .target = target,
@@ -52,12 +59,14 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("freetype2", .{});
     exe.root_module.linkSystemLibrary("input", .{});
     exe.root_module.linkSystemLibrary("libudev", .{ .use_pkg_config = .force });
+    exe.root_module.linkSystemLibrary("libseat", .{ .use_pkg_config = .force });
     exe.root_module.linkSystemLibrary("xkbcommon", .{});
     exe.root_module.linkSystemLibrary("drm", .{});
     exe.root_module.linkSystemLibrary("util", .{});
     exe.root_module.linkSystemLibrary("libpng", .{ .use_pkg_config = .force });
 
     exe.root_module.addImport("libinput", libinput.createModule());
+    exe.root_module.addImport("libseat", libseat.createModule());
     exe.root_module.addImport("libdrm", libdrm.createModule());
     exe.root_module.addImport("freetype", freetype.createModule());
     exe.root_module.addImport("libpng", libpng.createModule());

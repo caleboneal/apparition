@@ -1,13 +1,15 @@
 const std = @import("std");
-const linux = std.os.linux;
 const libdrm = @import("libdrm");
+const Seat = @import("seat.zig");
 const log = std.log.scoped(.drm);
 
-/// Owns the primary-node fd, DRM master, and the three libdrm allocations.
+/// Owns the primary-node fd, opened through the seat, and the three libdrm
+/// allocations. The seat provider grants and revokes DRM master.
 /// Discovery does not modeset. The caller must use crtc_id (not encoder.crtc_id),
 /// and restore any modeset / release framebuffers before calling deinit.
 /// Treat this as move-only; deinit must be called exactly once after success.
 pub const Device = struct {
+    seat: *Seat,
     fd: c_int,
     resources: *libdrm.drmModeRes,
     connector: *libdrm.drmModeConnector,
@@ -15,7 +17,7 @@ pub const Device = struct {
     mode: libdrm.drmModeModeInfo,
     crtc_id: u32,
 
-    pub fn init() !Device {
+    pub fn init(seat: *Seat) !Device {
         const capacity = libdrm.drmGetDevices2(0, null, 0);
         if (capacity < 0) {
             log.err("DRM enumeration failed: libdrm returned {d}", .{capacity});
@@ -44,7 +46,7 @@ pub const Device = struct {
             }
             if (device.*.nodes == null or device.*.nodes[libdrm.DRM_NODE_PRIMARY] == null) continue;
             const path: [*:0]const u8 = @ptrCast(device.*.nodes[libdrm.DRM_NODE_PRIMARY]);
-            return openCandidate(path) catch |err| {
+            return openCandidate(seat, path) catch |err| {
                 log.warn("Skipping {s}: {s}", .{ path, @errorName(err) });
                 continue;
             };
@@ -57,33 +59,22 @@ pub const Device = struct {
         libdrm.drmModeFreeEncoder(self.encoder);
         libdrm.drmModeFreeConnector(self.connector);
         libdrm.drmModeFreeResources(self.resources);
-        // Master may already have been dropped for a VT switch.
-        if (libdrm.drmIsMaster(self.fd) == 1 and libdrm.drmDropMaster(self.fd) != 0)
-            log.warn("Failed to drop DRM master on fd {d}: errno {d}", .{ self.fd, std.c._errno().* });
-        _ = linux.close(self.fd);
+        self.seat.closeDevice(self.fd);
         self.* = undefined;
     }
 };
 
-fn openCandidate(path: [*:0]const u8) !Device {
-    const result = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-    const err = linux.errno(result);
-    if (err != .SUCCESS) {
-        log.warn("Cannot open {s}: {s} ({d})", .{ path, @tagName(err), @intFromEnum(err) });
+fn openCandidate(seat: *Seat, path: [*:0]const u8) !Device {
+    const fd = seat.openDevice(path) catch |err| {
+        log.warn("Cannot open {s}: {s} (errno {d})", .{ path, @errorName(err), std.c._errno().* });
         return error.DrmOpenFailed;
-    }
-    // Raw Linux syscall errors are unsigned -errno, so check before narrowing.
-    const fd: c_int = @intCast(result);
-    errdefer _ = linux.close(fd);
+    };
+    errdefer seat.closeDevice(fd);
 
     if (libdrm.drmIsMaster(fd) != 1) {
-        if (libdrm.drmSetMaster(fd) != 0) {
-            log.warn("Cannot acquire DRM master on {s}: errno {d} (is another compositor running?)", .{ path, std.c._errno().* });
-            return error.DrmMasterUnavailable;
-        }
+        log.warn("No DRM master on {s} (is another compositor running?)", .{path});
+        return error.DrmMasterUnavailable;
     }
-    if (libdrm.drmIsMaster(fd) != 1) return error.DrmMasterUnavailable;
-    errdefer _ = libdrm.drmDropMaster(fd);
 
     const resources: *libdrm.drmModeRes = libdrm.drmModeGetResources(fd) orelse {
         log.warn("Cannot get KMS resources on {s}: errno {d}", .{ path, std.c._errno().* });
@@ -109,6 +100,7 @@ fn openCandidate(path: [*:0]const u8) !Device {
         selection.crtc_id, selection.mode.hdisplay,          selection.mode.vdisplay,
     });
     return .{
+        .seat = seat,
         .fd = fd,
         .resources = resources,
         .connector = selection.connector,

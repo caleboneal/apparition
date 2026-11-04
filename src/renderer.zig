@@ -5,6 +5,7 @@ const libdrm = @import("libdrm");
 const freetype = @import("freetype");
 const ghosttyvt = @import("ghostty-vt");
 const Drm = @import("drm.zig");
+const Seat = @import("seat.zig");
 const Colors = @import("colors.zig");
 const Images = @import("renderer/images.zig");
 
@@ -226,8 +227,8 @@ active: bool = true,
 images: std.ArrayList(Images.Visible) = .empty,
 previous_images: std.ArrayList(Images.Visible) = .empty,
 
-pub fn init(allocator: std.mem.Allocator) !Self {
-    var device = try Drm.Device.init();
+pub fn init(allocator: std.mem.Allocator, seat: *Seat) !Self {
+    var device = try Drm.Device.init(seat);
     errdefer device.deinit();
     const fd = device.fd;
     const mode = device.mode;
@@ -758,19 +759,18 @@ pub fn handleEvents(self: *Self) !void {
     if (result != 0 and std.posix.errno(result) != .INTR) return error.FailedToHandleDrmEvent;
 }
 
-/// Give the display to another VT: finish any flip, then drop DRM master.
-/// The CRTC is left for the next master to program.
+/// Give the display to another session: finish any flip. The seat provider
+/// revokes DRM master, and the CRTC is left for the next master to program.
 pub fn deactivate(self: *Self) void {
     if (self.flip_pending) self.finishPendingFlip();
-    if (libdrm.drmDropMaster(self.fd) != 0)
-        std.log.warn("Failed to drop DRM master: errno {d}", .{std.c._errno().*});
     self.active = false;
 }
 
-/// Retake DRM master after returning to this VT. The next present modesets
-/// and the next draw repaints everything, since another master owned the CRTC.
+/// Resume once the seat provider has restored DRM master. The next present
+/// modesets and the next draw repaints everything, since another master
+/// owned the CRTC.
 pub fn activate(self: *Self) !void {
-    if (libdrm.drmSetMaster(self.fd) != 0) return error.DrmMasterUnavailable;
+    if (libdrm.drmIsMaster(self.fd) != 1) return error.DrmMasterUnavailable;
     self.active = true;
     self.display_index = null;
     self.damage.invalidate();
