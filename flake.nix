@@ -1,9 +1,15 @@
 {
   description = "A minimal Zig development environment";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    zig-overlay = {
+      url = "github:mitchellh/zig-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, zig-overlay }:
     let
       systems = [
         "x86_64-linux"
@@ -16,12 +22,15 @@
     {
       devShells = forAllSystems (system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ zig-overlay.overlays.default ];
+          };
         in
         {
           default = pkgs.mkShell {
             packages = [
-              pkgs.zig
+              pkgs.zigpkgs."0.17.1"
               pkgs.pkg-config
               pkgs.libdrm
               pkgs.freetype

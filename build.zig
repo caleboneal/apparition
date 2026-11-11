@@ -51,6 +51,32 @@ pub fn build(b: *std.Build) void {
     });
     addPkgConfigIncludes(b, libpng, "libpng");
 
+    const libc = b.addTranslateC(.{
+        .root_source_file = b.path("src/c/libc.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const libudev = b.addTranslateC(.{
+        .root_source_file = b.path("src/c/libudev.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addPkgConfigIncludes(b, libudev, "libudev");
+
+    const xkbcommon = b.addTranslateC(.{
+        .root_source_file = b.path("src/c/xkbcommon.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addPkgConfigIncludes(b, xkbcommon, "xkbcommon");
+
+    const evdev = b.addTranslateC(.{
+        .root_source_file = b.path("src/c/evdev.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "apparition",
         .root_module = b.createModule(.{
@@ -79,6 +105,10 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("freetype", freetype.createModule());
     exe.root_module.addImport("harfbuzz", harfbuzz.createModule());
     exe.root_module.addImport("libpng", libpng.createModule());
+    exe.root_module.addImport("libc", libc.createModule());
+    exe.root_module.addImport("libudev", libudev.createModule());
+    exe.root_module.addImport("xkbcommon", xkbcommon.createModule());
+    exe.root_module.addImport("evdev", evdev.createModule());
 
     b.installArtifact(exe);
     b.installFile("src/fonts/OFL.txt", "share/licenses/apparition/JetBrainsMono-OFL.txt");
@@ -92,9 +122,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run the application");
     run_step.dependOn(&run_cmd.step);

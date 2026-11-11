@@ -1,12 +1,7 @@
 const std = @import("std");
 const vt = @import("ghostty-vt").input;
-const xkb = @cImport({
-    @cInclude("xkbcommon/xkbcommon.h");
-    @cInclude("xkbcommon/xkbcommon-keysyms.h");
-});
-const evdev = @cImport({
-    @cInclude("linux/input-event-codes.h");
-});
+const xkb = @import("xkbcommon");
+const evdev = @import("evdev");
 
 const Self = @This();
 

@@ -60,8 +60,8 @@ test "rejects malformed and truncated data" {
     try std.testing.expectError(error.InvalidData, decode(allocator, "not a png"));
 
     var buffer: [512]u8 = undefined;
-    const pixels = [_]u8{ 1, 2, 3, 4 } ** 16;
-    const encoded = try encodeForTest(png.PNG_FORMAT_RGBA, 4, 4, &pixels, &buffer);
+    const pixels: [16][4]u8 = @splat(.{ 1, 2, 3, 4 });
+    const encoded = try encodeForTest(png.PNG_FORMAT_RGBA, 4, 4, std.mem.sliceAsBytes(&pixels), &buffer);
     try std.testing.expectError(error.InvalidData, decode(allocator, encoded[0 .. encoded.len - 20]));
 }
 
@@ -102,7 +102,7 @@ test "kitty graphics PNG transmissions decode through libpng" {
 
 test "allocation failures surface as OutOfMemory" {
     var buffer: [512]u8 = undefined;
-    const pixels = [_]u8{ 1, 2, 3, 4 } ** 4;
-    const encoded = try encodeForTest(png.PNG_FORMAT_RGBA, 2, 2, &pixels, &buffer);
+    const pixels: [4][4]u8 = @splat(.{ 1, 2, 3, 4 });
+    const encoded = try encodeForTest(png.PNG_FORMAT_RGBA, 2, 2, std.mem.sliceAsBytes(&pixels), &buffer);
     try std.testing.expectError(error.OutOfMemory, decode(std.testing.failing_allocator, encoded));
 }

@@ -1,9 +1,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const libinput = @import("libinput");
-const udev = @cImport({
-    @cInclude("libudev.h");
-});
+const udev = @import("libudev");
 
 pub const Keyboard = @import("input/keyboard.zig");
 const Seat = @import("seat.zig");
@@ -61,7 +59,7 @@ keyboard: Keyboard,
 repeat: Repeat,
 /// Held keys whose press scrolled or switched VTs, so their releases are
 /// not reported to the application either.
-claimed: std.StaticBitSet(key_count) = .initEmpty(),
+claimed: std.StaticBitSet(key_count) = .empty,
 /// Borrowed libinput descriptor; poll for readability, but do not read or close it.
 fd: c_int,
 
@@ -127,7 +125,7 @@ pub fn deactivate(self: *Self) !void {
     var discard: [max_key_bytes]u8 = undefined;
     while (try self.next(0, &discard)) |_| {}
     self.repeat.key = null;
-    self.claimed = .initEmpty();
+    self.claimed = .empty;
 }
 
 /// Reopen input devices after returning to this VT.

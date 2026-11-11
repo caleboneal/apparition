@@ -1,20 +1,6 @@
 const std = @import("std");
 
-pub const c = @cImport({
-    // Optimized builds define _FORTIFY_SOURCE, whose glibc open() wrappers use
-    // GCC builtins that translate-c rejects. Fortification only affects C callers.
-    @cUndef("_FORTIFY_SOURCE");
-    @cDefine("_GNU_SOURCE", "1");
-    @cInclude("errno.h");
-    @cInclude("fcntl.h");
-    @cInclude("poll.h");
-    @cInclude("pty.h");
-    @cInclude("signal.h");
-    @cInclude("stdlib.h");
-    @cInclude("sys/ioctl.h");
-    @cInclude("sys/wait.h");
-    @cInclude("unistd.h");
-});
+pub const c = @import("libc");
 
 const Self = @This();
 
@@ -40,6 +26,18 @@ pub const Size = struct {
     width_px: u16 = 0,
     height_px: u16 = 0,
 };
+
+pub fn initSignalHandler(handler: ?*const fn (c_int) callconv(.c) void) void {
+    for ([_]c_int{ c.SIGINT, c.SIGTERM, c.SIGHUP }) |sig| {
+        _ = c.signal(sig, handler);
+    }
+    // C's SIG_IGN is address 1, not an aligned ARM function pointer.
+    std.posix.sigaction(.PIPE, &.{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    }, null);
+}
 
 pub fn init(allocator: std.mem.Allocator, shell: [*:0]const u8, window: Size) !Self {
     var exec_pipe: [2]c_int = undefined;

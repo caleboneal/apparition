@@ -2,11 +2,11 @@
     .name = .apparition,
     .version = "0.1.0",
     .fingerprint = 0x95615789a96cf7a7,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .ghostty = .{
-            .url = "git+https://github.com/ghostty-org/ghostty#f9a3f24a56bf05f70894e1a084809d4fffadf420",
-            .hash = "ghostty-1.3.2-dev-5UdBCwGGcgUfw6oYuprAOqYGmiKovuUlKdAcsdkUr7zM",
+            .url = "https://release.files.ghostty.org/libghostty-vt/1.0.0/libghostty-vt-1.0.0.tar.gz",
+            .hash = "ghostty-1.4.1-dev-5UdBC42jUAH6gFTaUyXGtolbhTf27EW0SZkK_lx5_fhQ",
         },
     },
     .paths = .{

@@ -1,13 +1,15 @@
 const std = @import("std");
-const Renderer = @import("renderer.zig");
-const Input = @import("input.zig");
-const Config = @import("config.zig");
-const Colors = @import("colors.zig");
-const Pty = @import("pty.zig");
-const Seat = @import("seat.zig");
-const Png = @import("png.zig");
-const c = Pty.c;
+
 const ghosttyvt = @import("ghostty-vt");
+
+const Colors = @import("colors.zig");
+const Config = @import("config.zig");
+const Input = @import("input.zig");
+const Png = @import("png.zig");
+const Pty = @import("pty.zig");
+const c = Pty.c;
+const Renderer = @import("renderer.zig");
+const Seat = @import("seat.zig");
 
 const config = Config{};
 var stopping = std.atomic.Value(bool).init(false);
@@ -134,15 +136,8 @@ fn earliest(a: ?c_int, b: ?c_int) ?c_int {
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
-    for ([_]c_int{ c.SIGINT, c.SIGTERM, c.SIGHUP }) |sig| {
-        _ = c.signal(sig, &stop);
-    }
-    // C's SIG_IGN is address 1, not an aligned ARM function pointer.
-    std.posix.sigaction(.PIPE, &.{
-        .handler = .{ .handler = std.posix.SIG.IGN },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    }, null);
+
+    Pty.initSignalHandler(&stop);
 
     // The seat provider owns the VT: it disables the console keyboard, grants
     // and revokes device access, and switches VTs on our behalf.
