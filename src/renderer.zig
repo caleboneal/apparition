@@ -469,6 +469,11 @@ saved_crtc: ?*libdrm.drmModeCrtc,
 is_modeset: bool = false,
 /// False while another VT owns the display; do not present until activate.
 active: bool = true,
+/// Hotspot of the pointer drawn over the frame. Null hides it.
+pointer: ?Pointer = null,
+/// Where each framebuffer last painted the pointer, so the next frame can
+/// copy the clean shadow back over the old sprite.
+pointer_fb: [2]?Pointer = .{ null, null },
 /// Kitty placements drawn by the latest frame, and by the frame before it
 /// (only its geometry is meaningful), to find rows whose images changed.
 images: std.ArrayList(Images.Visible) = .empty,
@@ -507,6 +512,8 @@ pub fn init(allocator: std.mem.Allocator, seat: *Seat) !Self {
         .saved_crtc = saved_crtc,
     };
 }
+
+pub const Pointer = struct { x: u32, y: u32 };
 
 pub const Rect = struct {
     x: u32,
@@ -927,7 +934,12 @@ pub fn drawTerminal(self: *Self, font: *Font, term: *ghosttyvt.Terminal) !bool {
     self.damage.clear = false;
     self.damage.key = key;
     self.damage.cursor = cursor;
-    return self.copyDamage(font.cell_height);
+    const copied = self.copyDamage(font.cell_height);
+    // The pointer is painted on the framebuffer, not the shadow, so row
+    // redraws stay free of it and the next frame can restore what was under it.
+    // Always paint: a dirty frame still has to composite the sprite on top.
+    const painted = self.paintPointer();
+    return copied or painted;
 }
 
 /// Copy the shadow's rows that the back buffer lacks. Returns false when
@@ -951,6 +963,105 @@ fn copyDamage(self: *Self, cell_height: u32) bool {
     }
     self.damage.full[index] = false;
     return changed;
+}
+
+/// Paint or erase the pointer on the back buffer. Returns true when its
+/// position changed, so a frame is presented even if no cell was damaged.
+fn paintPointer(self: *Self) bool {
+    const index = self.render_index;
+    const previous = self.pointer_fb[index];
+    const next_pointer = self.pointer;
+    if (previous == null and next_pointer == null) return false;
+    if (previous) |pos| self.restorePointer(pos);
+    if (next_pointer) |pos| drawPointer(self.backCanvas(), @intCast(pos.x), @intCast(pos.y));
+    self.pointer_fb[index] = next_pointer;
+    if (previous) |before| {
+        if (next_pointer) |after| return before.x != after.x or before.y != after.y;
+    }
+    return true;
+}
+
+fn backCanvas(self: *Self) Canvas {
+    return .{
+        .pixels = self.backPixels(),
+        .width = self.shadow.width,
+        .height = self.shadow.height,
+        .stride = self.shadow.stride,
+    };
+}
+
+fn backPixels(self: *Self) []u32 {
+    const ptr: [*]u32 = @ptrCast(@alignCast(self.framebuffers[self.render_index].map));
+    return ptr[0..self.shadow.pixels.len];
+}
+
+fn restorePointer(self: *Self, pos: Pointer) void {
+    const origin_x = @as(i32, @intCast(pos.x)) - pointer_hotspot_x;
+    const origin_y = @as(i32, @intCast(pos.y)) - pointer_hotspot_y;
+    const dest = self.backPixels();
+    const stride = self.shadow.stride;
+    var row: i32 = 0;
+    while (row < pointer_extent) : (row += 1) {
+        const y = origin_y + row;
+        if (y < 0 or y >= @as(i32, @intCast(self.shadow.height))) continue;
+        const uy: usize = @intCast(y);
+        var col: i32 = 0;
+        while (col < pointer_extent) : (col += 1) {
+            const x = origin_x + col;
+            if (x < 0 or x >= @as(i32, @intCast(self.shadow.width))) continue;
+            const ux: usize = @intCast(x);
+            dest[uy * stride + ux] = self.shadow.pixels[uy * stride + ux];
+        }
+    }
+}
+
+/// The arrow's tip is column 1 of the first row. A one-pixel shadow sits
+/// down and to the right, so the sprite covers 17 pixels from its origin.
+const pointer_hotspot_x: i32 = 1;
+const pointer_hotspot_y: i32 = 0;
+const pointer_extent: i32 = 17;
+const pointer_rows = [_][]const u8{
+    // 16 columns. The tip is the white pixel in column 1.
+    ".@..............",
+    ".##.............",
+    ".#@#............",
+    ".#@@#...........",
+    ".#@@@#..........",
+    ".#@@@@#.........",
+    ".#@@@@@#........",
+    ".#@@@@@@#.......",
+    ".#@@@@@@@#......",
+    ".#@@@@@@@@#.....",
+    ".#@@@@######....",
+    ".#@@#@#.........",
+    ".#@#..#.........",
+    ".##...#.........",
+    "......#.........",
+    ".......#........",
+};
+
+fn drawPointer(canvas: Canvas, x: i32, y: i32) void {
+    const origin_x = x - pointer_hotspot_x;
+    const origin_y = y - pointer_hotspot_y;
+    stampPointer(canvas, origin_x, origin_y, true);
+    stampPointer(canvas, origin_x, origin_y, false);
+}
+
+fn stampPointer(canvas: Canvas, origin_x: i32, origin_y: i32, shadow: bool) void {
+    const shift: i32 = @intFromBool(shadow);
+    for (pointer_rows, 0..) |row, dy| {
+        for (row, 0..) |pixel, dx| {
+            if (pixel == '.') continue;
+            const color: u32 = if (shadow or pixel == '#') 0x000000 else 0xFFFFFF;
+            const px = origin_x + @as(i32, @intCast(dx)) + shift;
+            const py = origin_y + @as(i32, @intCast(dy)) + shift;
+            if (px < 0 or py < 0) continue;
+            const ux: u32 = @intCast(px);
+            const uy: u32 = @intCast(py);
+            if (ux >= canvas.width or uy >= canvas.height) continue;
+            canvas.pixels[uy * canvas.stride + ux] = color;
+        }
+    }
 }
 
 fn markImageRows(self: *Self, geometry: Images.Geometry, cell_height: u32) void {
@@ -1177,6 +1288,28 @@ fn testRenderer(pixels: []u32, width: u16, height: u16, stride: usize) !Self {
         },
         .saved_crtc = null,
     };
+}
+
+test "pointer is painted over a frame and erased from its old pixels when it moves" {
+    const allocator = std.testing.allocator;
+    var font = testFont();
+    var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 4, .rows = 4 });
+    defer term.deinit(allocator);
+    try Colors.configure(&term, allocator, Colors.background);
+    var pixels: [32 * 32]u32 = undefined;
+    var renderer = try testRenderer(&pixels, 32, 32, 32);
+    defer renderer.deinitDrawing();
+    const background = rgbPixel(Colors.background);
+    renderer.pointer = .{ .x = 4, .y = 4 };
+    try std.testing.expect(try renderer.drawTerminal(&font, &term));
+    try std.testing.expectEqual(0xFFFFFF, pixels[4 * 32 + 4]);
+
+    renderer.pointer = .{ .x = 20, .y = 18 };
+    try std.testing.expect(try renderer.drawTerminal(&font, &term));
+    try std.testing.expectEqual(background, pixels[4 * 32 + 4]);
+    try std.testing.expectEqual(0xFFFFFF, pixels[18 * 32 + 20]);
+    // The shadow stays clean so a later row redraw cannot bake the sprite in.
+    try std.testing.expectEqual(background, renderer.shadow.pixels[18 * 32 + 20]);
 }
 
 test "bundled font faces load and cache each style independently" {

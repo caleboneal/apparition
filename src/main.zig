@@ -235,10 +235,24 @@ pub fn main(init: std.process.Init) !void {
         if (!pty_closed) {
             input.keyboard.options = .fromTerminal(&term);
             input.keyboard.scrollback = term.screens.active_key == .primary and config.scrollback_lines != 0;
+            input.mouse.configure(.{
+                .columns = cols,
+                .rows = rows,
+                .cell_width = font.cell_width,
+                .cell_height = font.cell_height,
+                .screen_width = renderer.mode.hdisplay,
+                .screen_height = renderer.mode.vdisplay,
+            }, .{
+                .tracking = term.flags.mouse_event,
+                .format = term.flags.mouse_format,
+                .alternate_scroll = term.screens.active_key == .alternate and term.modes.get(.mouse_alternate_scroll),
+                .cursor_application = term.modes.get(.cursor_keys),
+                .scrollback = term.screens.active_key == .primary and config.scrollback_lines != 0,
+            });
             const now = std.Io.Clock.awake.now(io).toNanoseconds();
             while (try input.next(now, &keys)) |event| switch (event) {
                 .bytes => |bytes| {
-                    // Typing returns to the live screen; new output does not.
+                    // Typing or a mouse report returns to the live screen; new output does not.
                     if (!term.screens.active.viewportIsBottom()) {
                         term.scrollViewport(.bottom);
                         pacing.dirty = true;
@@ -255,7 +269,18 @@ pub fn main(init: std.process.Init) !void {
                     });
                     pacing.dirty = true;
                 },
+                .scroll_lines => |lines| {
+                    term.scrollViewport(.{ .delta = lines });
+                    pacing.dirty = true;
+                },
             };
+            if (input.mouse.pixel()) |pos| {
+                const moved = if (renderer.pointer) |old| old.x != pos.x or old.y != pos.y else true;
+                if (moved) {
+                    renderer.pointer = .{ .x = pos.x, .y = pos.y };
+                    pacing.dirty = true;
+                }
+            }
             try pty.flush();
         }
 
@@ -423,6 +448,7 @@ test {
     _ = @import("input.zig");
     _ = @import("pty.zig");
     _ = @import("input/keyboard.zig");
+    _ = @import("input/mouse.zig");
     _ = @import("renderer.zig");
     _ = @import("renderer/box.zig");
     _ = @import("renderer/blocks.zig");

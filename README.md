@@ -50,6 +50,17 @@ move a scrolled-back view. History keeps `scrollback_lines` (10,000) lines, set
 in `src/config.zig`; 0 disables it. The alternate screen used by full-screen
 programs has no history, so these keys reach the program there.
 
+Mice and touchpads come through the same libinput seat. The pointer is drawn
+on the framebuffer. Presses, releases, motion, and the scroll wheel follow the
+program's tracking mode and format: X10, normal, button-event, and any-event,
+in the X10, UTF-8, SGR, URxvt, or SGR-pixels encoding, including keyboard
+modifiers. Side buttons are buttons 8 and 9. One wheel detent, or one cell of
+touchpad scrolling, is one click. While nothing is tracking the mouse, that
+scroll moves through history; on the alternate screen, alternate scroll (mode
+1007, on by default) turns it into cursor keys instead. A mouse report sent to
+the program also returns to the live screen. The pointer is clamped to the
+display, and clicks in the margin land on the nearest cell.
+
 The kitty graphics protocol is supported, so tools such as `kitten icat`,
 `chafa`, `timg`, and image previews in `yazi` or `ranger` can show images.
 PNG data is decoded with libpng; raw RGB and RGBA are accepted too. Images may
@@ -121,8 +132,8 @@ shapes meet neighboring cell backgrounds without gaps. This covers the solid
 and thin arrows, solid and outlined half circles, corner triangles, and slash
 separators. Other Nerd Font icons still need a font that has them.
 
-This is still rudimentary: no mouse input,
-clipboard, IME/compose, fallback beyond the emoji font, or display hotplug/
+This is still rudimentary: no clipboard, text selection,
+IME/compose, fallback beyond the emoji font, or display hotplug/
 resize handling. Bold,
 italic, and bold-italic text use separate font faces. Underlines support single,
 double, curly, dotted, and dashed styles, including spaces, wide cells, and
@@ -189,6 +200,7 @@ Tests cover PTY shell startup and sizing (including pixel size), exec
 failure, queued input, libpng decoding and kitty PNG transmissions, kitty image
 layering, scaling, and incremental redraws,
 terminal parsing/replies, legacy and kitty key encoding, terminal key modes,
+mouse tracking, wheel scrolling, alternate-scroll cursor keys,
 non-Latin layouts, autorepeat timing, synchronized output timeouts, VT
 switch keys and seat enable/disable ordering, DRM routing helpers, and
 incremental rendering without requiring DRM or input hardware. Renderer tests

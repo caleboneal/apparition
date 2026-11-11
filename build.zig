@@ -116,7 +116,7 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .root_module = exe.root_module });
     const run_tests = b.addRunArtifact(tests);
-    const test_step = b.step("test", "Run terminal, keyboard, and renderer tests");
+    const test_step = b.step("test", "Run terminal, keyboard, mouse, and renderer tests");
     test_step.dependOn(&run_tests.step);
 
     const run_cmd = b.addRunArtifact(exe);

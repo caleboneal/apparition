@@ -114,7 +114,19 @@ fn xkbCode(evdev_key: u32) xkb.xkb_keycode_t {
     return evdev_key + 8;
 }
 
-fn modActive(self: *Self, name: [*:0]const u8) bool {
+/// Modifiers held now, for mouse reports as well as key encoding.
+pub fn heldModifiers(self: *const Self) vt.KeyMods {
+    return .{
+        .shift = self.modActive(xkb.XKB_MOD_NAME_SHIFT),
+        .ctrl = self.modActive(xkb.XKB_MOD_NAME_CTRL),
+        .alt = self.modActive(xkb.XKB_MOD_NAME_ALT),
+        .super = self.modActive(xkb.XKB_MOD_NAME_LOGO),
+        .caps_lock = self.modActive(xkb.XKB_MOD_NAME_CAPS),
+        .num_lock = self.modActive(xkb.XKB_MOD_NAME_NUM),
+    };
+}
+
+fn modActive(self: *const Self, name: [*:0]const u8) bool {
     return xkb.xkb_state_mod_name_is_active(self.state, name, xkb.XKB_STATE_MODS_EFFECTIVE) > 0;
 }
 
