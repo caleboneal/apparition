@@ -11,7 +11,6 @@ const c = Pty.c;
 const Renderer = @import("renderer.zig");
 const Seat = @import("seat.zig");
 
-const config = Config{};
 var stopping = std.atomic.Value(bool).init(false);
 
 fn stop(_: c_int) callconv(.c) void {
@@ -136,6 +135,7 @@ fn earliest(a: ?c_int, b: ?c_int) ?c_int {
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
+    const config = try Config.load(init.arena.allocator(), io, init.environ_map);
 
     Pty.initSignalHandler(&stop);
 
@@ -170,7 +170,7 @@ pub fn main(init: std.process.Init) !void {
         .default_modes = .{ .grapheme_cluster = config.grapheme_clustering },
     });
     defer term.deinit(gpa);
-    try Colors.configure(&term, gpa);
+    try Colors.configure(&term, gpa, config.background);
     // Kitty placements derive the cell size from these, so cover exactly the
     // grid; the display's leftover margin is not part of any cell.
     term.width_px = @as(u32, cols) * font.cell_width;
@@ -419,6 +419,7 @@ test "terminal stream parses split output and queues cursor reports" {
 }
 
 test {
+    _ = @import("config.zig");
     _ = @import("input.zig");
     _ = @import("pty.zig");
     _ = @import("input/keyboard.zig");

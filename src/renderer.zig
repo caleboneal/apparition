@@ -1349,7 +1349,7 @@ test "cached glyphs render with backgrounds, reverse colors and transparent pixe
 
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 1 });
     defer term.deinit(allocator);
-    try Colors.configure(&term, allocator);
+    try Colors.configure(&term, allocator, Colors.background);
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     stream.nextSlice("\x1b[?25lA\x1b[41m \x1b[0m");
@@ -1382,7 +1382,7 @@ test "SGR font styles and block cursor use the matching cached face" {
     }
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 5, .rows = 1 });
     defer term.deinit(allocator);
-    try Colors.configure(&term, allocator);
+    try Colors.configure(&term, allocator, Colors.background);
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     stream.nextSlice("\x1b[?25lA\x1b[1mA\x1b[22;3mA\x1b[1;4mA\x1b[0mA");
@@ -1452,7 +1452,7 @@ test "underlines cover spaces and wide cells with colors, resets and invisibilit
     try font.glyphs.put(allocator, glyphKey('界', .regular, 2), .{ .pixels = alpha, .width = 4, .rows = 1, .left = 0, .top = 0 });
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 7, .rows = 1 });
     defer term.deinit(allocator);
-    try Colors.configure(&term, allocator);
+    try Colors.configure(&term, allocator, Colors.background);
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     stream.nextSlice("\x1b[?25l\x1b[4m \x1b[58;2;18;52;86m \x1b[24m \x1b[4;8m \x1b[28;59m界\x1b[24m ");
@@ -1480,7 +1480,7 @@ test "strikethrough and overline cover spaces in the text color" {
     defer font.deinit();
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 1 });
     defer term.deinit(allocator);
-    try Colors.configure(&term, allocator);
+    try Colors.configure(&term, allocator, Colors.background);
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     stream.nextSlice("\x1b[?25l\x1b[9;31m \x1b[29;53m \x1b[55;4;58;2;18;52;86m ");
@@ -1542,7 +1542,7 @@ test "emoji sequences render as one color glyph within their cells" {
         .default_modes = .{ .grapheme_cluster = true },
     });
     defer term.deinit(allocator);
-    try Colors.configure(&term, allocator);
+    try Colors.configure(&term, allocator, Colors.background);
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     // A skin tone, a ZWJ family, a flag, a keycap, a VS16 heart, and a plain emoji.
@@ -1595,7 +1595,7 @@ test "box drawing fills whole cells so lines join across rows and columns" {
     defer font.deinit();
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 3 });
     defer term.deinit(allocator);
-    try Colors.configure(&term, allocator);
+    try Colors.configure(&term, allocator, Colors.background);
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     stream.nextSlice("\x1b[?25l┌─┐\r\n│ │\r\n└─┘");
@@ -1665,7 +1665,7 @@ test "dirty rows leave clean pixels untouched and accumulate across both buffers
     var font = testFont();
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 3 });
     defer term.deinit(allocator);
-    try Colors.configure(&term, allocator);
+    try Colors.configure(&term, allocator, Colors.background);
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     stream.nextSlice("\x1b[?25l");
@@ -1716,7 +1716,7 @@ test "incremental frames match full redraws through cursor, color, screen and sc
     var font = testFont();
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 3 });
     defer term.deinit(allocator);
-    try Colors.configure(&term, allocator);
+    try Colors.configure(&term, allocator, Colors.background);
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     var pixels: [2][24]u32 = @splat(@splat(99));
@@ -1777,7 +1777,7 @@ test "scrolled viewports render history and hide an off-screen cursor" {
     var font = testFont();
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 3, .max_scrollback_bytes = null });
     defer term.deinit(allocator);
-    try Colors.configure(&term, allocator);
+    try Colors.configure(&term, allocator, Colors.background);
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     var pixels: [2][9]u32 = @splat(@splat(99));
@@ -1833,7 +1833,7 @@ test "kitty images draw in z layers and incremental frames match full redraws" {
     var font = testFont();
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 4, .rows = 3 });
     defer term.deinit(allocator);
-    try Colors.configure(&term, allocator);
+    try Colors.configure(&term, allocator, Colors.background);
     term.width_px = 4;
     term.height_px = 3;
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
@@ -1899,7 +1899,7 @@ test "pending flips retain source damage and wide cursor moves erase the old row
     try font.glyphs.put(allocator, glyphKey('界', .regular, 2), .{ .pixels = alpha, .width = 2, .rows = 1, .left = 0, .top = 0 });
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 3 });
     defer term.deinit(allocator);
-    try Colors.configure(&term, allocator);
+    try Colors.configure(&term, allocator, Colors.background);
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     var pixels: [2][9]u32 = @splat(@splat(99));
@@ -1930,7 +1930,7 @@ test "failed row drawing retains damage until a successful retry" {
     defer font.glyphs.deinit(allocator);
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 3, .rows = 3 });
     defer term.deinit(allocator);
-    try Colors.configure(&term, allocator);
+    try Colors.configure(&term, allocator, Colors.background);
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     var pixels: [2][9]u32 = @splat(@splat(99));
@@ -1969,7 +1969,7 @@ test "SGR colors preserve indexed and RGB values and apply intensity and inverse
     const allocator = std.testing.allocator;
     var term = try ghosttyvt.Terminal.init(std.testing.io, allocator, .{ .cols = 16, .rows = 1 });
     defer term.deinit(allocator);
-    try Colors.configure(&term, allocator);
+    try Colors.configure(&term, allocator, Colors.background);
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = allocator, .handler = .init(&term) });
     defer stream.deinit();
     stream.nextSlice("\x1b[31mA\x1b[1mB\x1b[22;91mC\x1b[0;38;5;196mD" ++

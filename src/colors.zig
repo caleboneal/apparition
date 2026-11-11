@@ -3,7 +3,8 @@ const ghosttyvt = @import("ghostty-vt");
 const Config = @import("config.zig");
 
 pub const foreground: ghosttyvt.color.RGB = .{ .r = 0xE5, .g = 0xE5, .b = 0xE5 };
-pub const background = hex((Config{}).background);
+/// The background used when no config file sets one.
+pub const background = (Config{}).background;
 
 fn hex(rgb: u24) ghosttyvt.color.RGB {
     return .{
@@ -29,10 +30,10 @@ pub const palette: ghosttyvt.color.Palette = palette: {
 
 /// Configure a newly initialized terminal, before feeding it any output.
 /// changeDefault owns the palette copy so OSC resets restore our defaults.
-pub fn configure(term: *ghosttyvt.Terminal, allocator: std.mem.Allocator) !void {
+pub fn configure(term: *ghosttyvt.Terminal, allocator: std.mem.Allocator, default_background: ghosttyvt.color.RGB) !void {
     try term.colors.palette.changeDefault(allocator, palette);
     term.colors.foreground = .init(foreground);
-    term.colors.background = .init(background);
+    term.colors.background = .init(default_background);
 }
 
 test "xterm palette includes ANSI colors, cube and grayscale" {
@@ -48,7 +49,7 @@ test "xterm palette includes ANSI colors, cube and grayscale" {
 test "OSC palette and default-color overrides reset to configured colors" {
     var term = try ghosttyvt.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = 4, .rows = 1 });
     defer term.deinit(std.testing.allocator);
-    try configure(&term, std.testing.allocator);
+    try configure(&term, std.testing.allocator, background);
     var stream = ghosttyvt.TerminalStream.init(.{ .allocator = std.testing.allocator, .handler = .init(&term) });
     defer stream.deinit();
     stream.nextSlice("\x1b]4;1;#123456\x07\x1b]10;#abcdef\x07\x1b]11;#010203\x07");
